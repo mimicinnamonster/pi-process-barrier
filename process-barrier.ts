@@ -34,6 +34,10 @@
  * section (custom tools only appear there when a snippet is provided).
  */
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
 import { type Static, Type } from "typebox";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -44,6 +48,45 @@ const LIST_FALLBACK_MS = 1000; // no reply -> assume no manager (extension not l
 const POLL_INTERVAL_MS = 2500; // safety-net poll while blocked
 const DEFAULT_CHECK_INTERVAL_MS = 300_000; // 5 min: wake the agent to verify nothing is hanging
 const MIN_CHECK_INTERVAL_MS = 5_000; // sanity floor: keep interplay with the follow-up call sane
+const MAX_CHECK_INTERVAL_SECONDS = 86_400; // 24h cap for the settings value
+
+/**
+ * Resolve pi's agent settings directory. Mirrors pi core's getAgentDir()
+ * (dist/config.ts: PI_CODING_AGENT_DIR override, else ~/.pi/agent).
+ */
+function getAgentDir(): string {
+  const envDir = process.env.PI_CODING_AGENT_DIR;
+  if (envDir) {
+    return envDir === "~" ? homedir() : envDir.replace(/^~\//, `${homedir()}/`);
+  }
+  return join(homedir(), ".pi", "agent");
+}
+
+/**
+ * Read extension config from pi settings.json. pi core exposes no settings
+ * API to extensions; the established pattern (pi-subagents reads the
+ * "subagents" key, @aliou/pi-processes uses a config loader over the same
+ * file) is to read the file directly at factory init.
+ *
+ * Expected shape (top-level key "processBarrier"):
+ *   { "processBarrier": { "checkIntervalSeconds": 300 } }
+ * Absent key/invalid value -> fallback (default).
+ */
+function readSettings(): { checkIntervalSeconds?: number } {
+  try {
+    const raw = readFileSync(join(getAgentDir(), "settings.json"), "utf-8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const cfg = parsed?.processBarrier;
+    if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) return {};
+    const rawInterval = (cfg as Record<string, unknown>).checkIntervalSeconds;
+    if (typeof rawInterval !== "number" || !Number.isFinite(rawInterval)) {
+      return {};
+    }
+    return { checkIntervalSeconds: rawInterval };
+  } catch {
+    return {};
+  }
+}
 
 /** Parse an integer env var, falling back when unset/invalid. */
 function readEnvInt(name: string, fallback: number): number {
@@ -345,24 +388,39 @@ const BarrierParams = Type.Object({
     Type.Number({
       description:
         "Direct-call override: seconds to wait before waking the agent for a periodic health check (0 disables). " +
-        "On automatic injection the env var PI_PROCESS_BARRIER_CHECK_INTERVAL_MS is used instead.",
+        "On automatic injection, the pi setting processBarrier.checkIntervalSeconds is used " +
+        "(fallback: env PI_PROCESS_BARRIER_CHECK_INTERVAL_MS, default 300).",
     }),
   ),
 });
 
 export default function (pi: ExtensionAPI): void {
-  // Factory-level config, read once at extension init (env is available here).
-  // PI_PROCESS_BARRIER_CHECK_INTERVAL_MS: wait time before waking the agent to
-  // verify processes aren't hanging (0 disables check-ins).
-  const rawCheckIntervalMs = readEnvInt(
-    "PI_PROCESS_BARRIER_CHECK_INTERVAL_MS",
-    DEFAULT_CHECK_INTERVAL_MS,
-  );
-  const checkIntervalMs =
-    rawCheckIntervalMs > 0
-      ? Math.max(rawCheckIntervalMs, MIN_CHECK_INTERVAL_MS)
-      : 0;
-  const checkIntervalSeconds = checkIntervalMs > 0 ? checkIntervalMs / 1000 : 0;
+  // Factory-level config, read once at extension init. Precedence (highest wins):
+  // 1. pi settings key "processBarrier" -> { checkIntervalSeconds } (0 = disabled)
+  // 2. PI_PROCESS_BARRIER_CHECK_INTERVAL_MS env var (0 = disabled)
+  // 3. default 300s. A direct `checkIntervalSeconds` tool param still
+  //    overrides all of these on manual calls.
+  const settingsInterval = readSettings().checkIntervalSeconds;
+  let checkIntervalSeconds: number;
+  if (
+    settingsInterval !== undefined &&
+    Number.isFinite(settingsInterval) &&
+    settingsInterval !== 0
+  ) {
+    // Clamp a positive settings value to a sane range; 0 must stay disabled.
+    checkIntervalSeconds =
+      Math.min(Math.max(settingsInterval, MIN_CHECK_INTERVAL_MS / 1000), MAX_CHECK_INTERVAL_SECONDS);
+  } else {
+    const rawCheckIntervalMs = readEnvInt(
+      "PI_PROCESS_BARRIER_CHECK_INTERVAL_MS",
+      DEFAULT_CHECK_INTERVAL_MS,
+    );
+    const checkIntervalMs =
+      rawCheckIntervalMs > 0
+        ? Math.max(rawCheckIntervalMs, MIN_CHECK_INTERVAL_MS)
+        : 0;
+    checkIntervalSeconds = checkIntervalMs > 0 ? checkIntervalMs / 1000 : 0;
+  }
   // PI_PROCESS_BARRIER_TIMEOUT_SECONDS: overrides the default max wait (600s);
   // always capped at MAX_TIMEOUT_SECONDS (1800s).
   const defaultTimeoutSeconds = Math.min(
@@ -381,6 +439,7 @@ export default function (pi: ExtensionAPI): void {
       "It is automatically injected when your turn ends while processes are still running, so you will be woken with the results. " +
       "If a configurable check-in interval has elapsed while processes still run, you will be woken periodically to verify processes aren't hanging; " +
       "it is safe to keep your turn short (check process list/output, decide, end your turn) and the barrier will continue waiting. " +
+      "The interval is configurable in pi settings (processBarrier.checkIntervalSeconds; 0 disables periodic check-ins). " +
       "Do not call it directly unless you deliberately want to block until processes finish; if no processes are running it will error.",
     // No promptSnippet: custom tools without one are omitted from the
     // "Available tools" section of the default system prompt (verified in

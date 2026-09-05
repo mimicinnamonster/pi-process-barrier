@@ -19,6 +19,29 @@ A small [pi](https://github.com/earendil-works/pi) extension that keeps pi-subag
 - Tool calls resolve **by name with no provenance check**, so the injected call executes like any normal call.
 - `execute()` blocks using the shared extension event bus: `processes:request:list` to snapshot/refresh, `processes:ended` (and `processes:changed`) broadcast notifications, a 2.5s polling safety net, and a timeout defaulting to 600s (max 1800s).
 - On completion the loop emits the automatic follow-up LLM call — that **is** the wake-up reaction.
+- If a configurable check-in interval elapses while processes still run, the barrier resolves early with a *checkpoint* result (no `terminate: true`), the agent is woken to verify nothing is hanging, and when it ends its turn the barrier is re-injected for a fresh wait (resolve-and-reinject). Exactly one LLM call per check-in; the drain can never arm anywhere in the cycle.
+
+## Configuration
+
+The periodic check-in interval (waking the agent to check whether processes are hanging) is configured in **pi settings** at `/Users/mimi/.pi/agent/settings.json` under a top-level `processBarrier` key:
+
+```jsonc
+{
+  "processBarrier": {
+    "checkIntervalSeconds": 300   // 0 = disable periodic check-ins; default 300
+  }
+}
+```
+
+Precedence (highest wins):
+1. Direct tool call param `checkIntervalSeconds` (manual calls only)
+2. Pi settings `processBarrier.checkIntervalSeconds` (0 disables; clamped to 5s–24h)
+3. Env `PI_PROCESS_BARRIER_CHECK_INTERVAL_MS` (0 disables; default 300000)
+4. Default: 300s
+
+`0` disables periodic check-ins entirely — the barrier then only resolves on all-processes-exit or the timeout.
+
+pi exposes no settings API to extensions; the extension reads the settings.json file at factory init, following the same pattern pi-subagents uses for its `subagents` key. A reload is required for settings or code changes to take effect.
 
 ## Install / wiring
 
