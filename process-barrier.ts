@@ -42,7 +42,20 @@ const DEFAULT_TIMEOUT_SECONDS = 600;
 const MAX_TIMEOUT_SECONDS = 1800;
 const LIST_FALLBACK_MS = 1000; // no reply -> assume no manager (extension not loaded)
 const POLL_INTERVAL_MS = 2500; // safety-net poll while blocked
-const MAX_POLLS = 100;
+const DEFAULT_CHECK_INTERVAL_MS = 300_000; // 5 min: wake the agent to verify nothing is hanging
+const MIN_CHECK_INTERVAL_MS = 5_000; // sanity floor: keep interplay with the follow-up call sane
+
+/** Parse an integer env var, falling back when unset/invalid. */
+function readEnvInt(name: string, fallback: number): number {
+  try {
+    const raw = process.env[name];
+    if (raw === undefined || raw === "") return fallback;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) ? n : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 const BARRIER_TOOL_NAME = "process_barrier";
 
@@ -61,17 +74,26 @@ interface ProcessInfo {
   endReason: string | null;
   signal: { name: string; number: number | null; description: string } | null;
   errorMessage: string | null;
+  /** Epoch ms when the process started (when the manager provides it). */
+  startTime: number | null;
 }
 
 interface ReportEntry {
   id: string;
   name: string;
-  status: string; // exited | killed | terminate_timeout | still_running
+  status: string; // exited | killed | terminate_timeout | running | terminating | still_running
   exitCode: number | null;
   success: boolean | null;
   endReason: string | null;
   signalName: string | null;
   errorMessage: string | null;
+  startTime: number | null;
+}
+
+/** Outcome of waiting: either the final report or an early check-in wake-up. */
+interface WaitResult {
+  entries: ReportEntry[];
+  checkpoint: boolean;
 }
 
 /** Statuses that count as still alive at snapshot time. */
@@ -121,6 +143,7 @@ function toReportEntry(p: ProcessInfo): ReportEntry {
     endReason: p.endReason,
     signalName: p.signal?.name ?? null,
     errorMessage: p.errorMessage,
+    startTime: p.startTime ?? null,
   };
 }
 
@@ -155,6 +178,26 @@ function formatReport(entries: ReportEntry[], timedOutSeconds: number): string {
 }
 
 /**
+ * Check-in formatter: the barrier resolved early (interval elapsed, processes
+ * still running) to wake the agent for a periodic health check. Shows live
+ * per-process status and uptime when the manager provides startTime.
+ */
+function formatCheckpoint(entries: ReportEntry[], elapsedSeconds: number): string {
+  const lines = entries.map((e) => {
+    const uptime =
+      typeof e.startTime === "number" && e.startTime > 0
+        ? `, uptime: ${Math.max(0, Math.round((Date.now() - e.startTime) / 1000))}s`
+        : "";
+    return `- ${e.id} \"${e.name}\" (${e.status}${uptime})`;
+  });
+  return [
+    `Still waiting after ${elapsedSeconds}s; processes still running:`,
+    ...lines,
+    "Check whether any process is hanging (process list / process output), then simply end your turn: the barrier will keep waiting.",
+  ].join("\n");
+}
+
+/**
  * Block until every watched process reaches a final status (exited, killed,
  * terminate_timeout), the deadline passes, or the execute() abort signal
  * fires. Uses the manager's live `processes:ended` broadcasts plus a polling
@@ -165,21 +208,23 @@ function waitForAllExited(
   watched: ProcessInfo[],
   deadline: number,
   signal: AbortSignal | undefined,
-): Promise<ReportEntry[]> {
+  checkIntervalMs = 0,
+): Promise<WaitResult> {
   return new Promise((resolve) => {
     const watchIds = new Set(watched.map((p) => p.id));
     const report = new Map<string, ReportEntry>();
+    const startTime = Date.now();
+    let latestList: ProcessInfo[] = [];
     let settled = false;
     let scheduled = false;
-    let pollCount = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const unsubs: Array<() => void> = [];
 
-    const finish = (entries: ReportEntry[]): void => {
+    const finish = (result: WaitResult): void => {
       if (settled) return;
       settled = true;
       cleanup();
-      resolve(entries);
+      resolve(result);
     };
 
     const cleanup = (): void => {
@@ -201,7 +246,7 @@ function waitForAllExited(
     };
 
     const onAbort = (): void => {
-      finish(finalize());
+      finish({ entries: finalize(), checkpoint: false });
     };
 
     const finalize = (): ReportEntry[] => {
@@ -221,22 +266,36 @@ function waitForAllExited(
       return true;
     };
 
+    const checkpointEntries = (): ReportEntry[] => {
+      const byId = new Map(latestList.map((p) => [p.id, p] as const));
+      return watched.map((p) => {
+        const live = byId.get(p.id);
+        const base = live ?? p;
+        return {
+          ...toReportEntry(base),
+          status: isLive(base.status) ? base.status : "still_running",
+        };
+      });
+    };
+
     const tick = async (): Promise<void> => {
       if (settled) return;
-      pollCount += 1;
-      if (pollCount > MAX_POLLS) {
-        finish(finalize());
-        return;
-      }
       const list = await requestList(pi);
       if (settled) return;
+      latestList = list;
       for (const p of list) record(p);
       if (allDone()) {
-        finish(finalize());
+        finish({ entries: finalize(), checkpoint: false });
         return;
       }
       if (Date.now() >= deadline) {
-        finish(finalize());
+        finish({ entries: finalize(), checkpoint: false });
+        return;
+      }
+      if (checkIntervalMs > 0 && Date.now() - startTime >= checkIntervalMs) {
+        // Early resolve: the agent is woken for a health check; its next
+        // terminal turn re-injects the barrier and the wait continues.
+        finish({ entries: checkpointEntries(), checkpoint: true });
         return;
       }
       scheduled = false;
@@ -255,7 +314,7 @@ function waitForAllExited(
     unsubs.push(
       pi.events.on("processes:ended", (data) => {
         record(data as ProcessInfo);
-        if (allDone()) finish(finalize());
+        if (allDone()) finish({ entries: finalize(), checkpoint: false });
       }),
       pi.events.on("processes:changed", () => {
         // A process may have ended without us catching the individual event;
@@ -265,7 +324,7 @@ function waitForAllExited(
     );
 
     if (signal?.aborted) {
-      finish(finalize());
+      finish({ entries: finalize(), checkpoint: false });
       return;
     }
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -282,15 +341,46 @@ const BarrierParams = Type.Object({
       description: "Max seconds to wait (default 600, max 1800).",
     }),
   ),
+  checkIntervalSeconds: Type.Optional(
+    Type.Number({
+      description:
+        "Direct-call override: seconds to wait before waking the agent for a periodic health check (0 disables). " +
+        "On automatic injection the env var PI_PROCESS_BARRIER_CHECK_INTERVAL_MS is used instead.",
+    }),
+  ),
 });
 
 export default function (pi: ExtensionAPI): void {
+  // Factory-level config, read once at extension init (env is available here).
+  // PI_PROCESS_BARRIER_CHECK_INTERVAL_MS: wait time before waking the agent to
+  // verify processes aren't hanging (0 disables check-ins).
+  const rawCheckIntervalMs = readEnvInt(
+    "PI_PROCESS_BARRIER_CHECK_INTERVAL_MS",
+    DEFAULT_CHECK_INTERVAL_MS,
+  );
+  const checkIntervalMs =
+    rawCheckIntervalMs > 0
+      ? Math.max(rawCheckIntervalMs, MIN_CHECK_INTERVAL_MS)
+      : 0;
+  const checkIntervalSeconds = checkIntervalMs > 0 ? checkIntervalMs / 1000 : 0;
+  // PI_PROCESS_BARRIER_TIMEOUT_SECONDS: overrides the default max wait (600s);
+  // always capped at MAX_TIMEOUT_SECONDS (1800s).
+  const defaultTimeoutSeconds = Math.min(
+    Math.max(
+      readEnvInt("PI_PROCESS_BARRIER_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
+      1,
+    ),
+    MAX_TIMEOUT_SECONDS,
+  );
+
   pi.registerTool({
     name: BARRIER_TOOL_NAME,
     label: "Wait for Processes",
     description:
       "Blocks until all processes started with the process tool have exited, then reports their final statuses. " +
       "It is automatically injected when your turn ends while processes are still running, so you will be woken with the results. " +
+      "If a configurable check-in interval has elapsed while processes still run, you will be woken periodically to verify processes aren't hanging; " +
+      "it is safe to keep your turn short (check process list/output, decide, end your turn) and the barrier will continue waiting. " +
       "Do not call it directly unless you deliberately want to block until processes finish; if no processes are running it will error.",
     // No promptSnippet: custom tools without one are omitted from the
     // "Available tools" section of the default system prompt (verified in
@@ -314,15 +404,41 @@ export default function (pi: ExtensionAPI): void {
       }
 
       const timeoutSeconds = Math.min(
-        Math.max(params.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS, 1),
+        Math.max(params.timeoutSeconds ?? defaultTimeoutSeconds, 1),
         MAX_TIMEOUT_SECONDS,
       );
+      const effCheckIntervalSeconds = Math.max(
+        params.checkIntervalSeconds ?? checkIntervalSeconds,
+        0,
+      );
+      const waitStartedAt = Date.now();
       const deadline = Date.now() + timeoutSeconds * 1000;
       console.error(
-        `[process-barrier] waiting for ${running.length} process(es): ${running.map((p) => p.id).join(", ")} (timeout ${timeoutSeconds}s)`,
+        `[process-barrier] waiting for ${running.length} process(es): ${running.map((p) => p.id).join(", ")} (timeout ${timeoutSeconds}s, check-in ${effCheckIntervalSeconds}s)`,
       );
 
-      const entries = await waitForAllExited(pi, running, deadline, signal);
+      const { entries, checkpoint } = await waitForAllExited(
+        pi,
+        running,
+        deadline,
+        signal,
+        effCheckIntervalSeconds > 0 ? effCheckIntervalSeconds * 1000 : 0,
+      );
+      if (checkpoint) {
+        const elapsedSeconds = Math.max(
+          0,
+          Math.round((Date.now() - waitStartedAt) / 1000),
+        );
+        return {
+          content: [
+            { type: "text", text: formatCheckpoint(entries, elapsedSeconds) },
+          ],
+          details: { checkpoint: true, processes: entries },
+          // Intentionally no `terminate: true`: the follow-up LLM call after
+          // this tool batch is the periodic check-in reaction; when the agent
+          // ends its turn again the barrier is re-injected for a fresh wait.
+        };
+      }
       const timedOutSeconds = Math.max(
         0,
         Math.round((deadline - Date.now()) / 1000),
@@ -382,7 +498,7 @@ export default function (pi: ExtensionAPI): void {
       };
       m.content.push(toolCall as never);
       console.error(
-        `[process-barrier] injected ${BARRIER_TOOL_NAME} for ${running.length} running process(es): ${running.map((p) => p.id).join(", ")}`,
+        `[process-barrier] injected ${BARRIER_TOOL_NAME} for ${running.length} running process(es): ${running.map((p) => p.id).join(", ")} (check-in ${checkIntervalSeconds}s)`,
       );
     } catch (err) {
       // Never throw from a message_end handler: a failure here must not break
