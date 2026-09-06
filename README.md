@@ -4,8 +4,8 @@ A small [pi](https://github.com/earendil-works/pi) extension that keeps pi-subag
 
 ## What it does
 
-- Registers a blocking tool named `process_barrier` **eagerly at session start** (required for child-session spawn preflight and by-name tool-call resolution) but **inactive by default**: the tool is present in the model's callable schema only while processes are actually running (see [Dynamic availability](#dynamic-availability)).
-- Hooks `message_end`: when an assistant turn ends while processes are still running, it **injects a synthetic `toolCall` for `process_barrier` into the final message** (in place).
+- Registers a blocking tool named `barrier` **eagerly at session start** (required for child-session spawn preflight and by-name tool-call resolution) but **inactive by default**: the tool is present in the model's callable schema only while processes are actually running (see [Dynamic availability](#dynamic-availability)).
+- Hooks `message_end`: when an assistant turn ends while processes are still running, it **injects a synthetic `toolCall` for `barrier` into the final message** (in place).
 - The barrier's `execute()` **blocks** until every watched process exits (or the timeout passes), then returns a summary of each process's final status as its `tool_result`.
 - The agent loop's automatic follow-up LLM call is the **reaction turn**: with the summary in context, the agent reports, retries, or starts more processes. When it finally ends its turn with nothing running, the run completes normally.
 - When **no processes are running** the tool is **absent from the model's function-calling schema** (see [Dynamic availability](#dynamic-availability)), so models cannot call it ad hoc at all.
@@ -17,10 +17,10 @@ A small [pi](https://github.com/earendil-works/pi) extension that keeps pi-subag
 
 The tool is registered for the whole session but only *visible* while needed:
 
-- **Registered at session start (eagerly)**: `pi.registerTool()` runs once at factory init. Registration must happen before any subagent spawns: pi-subagents validates each agent's frontmatter `tools:` allowlist against *registered* tools, and agents that list `process_barrier` (`delegate`, `oracle`, `scout`, `worker`, `worker-full`) would fail to spawn with "requested unavailable child tools" without it. Injected `toolCall`s also resolve by name only while the tool is registered.
-- **Active-set toggle**: the extension reads `pi.getActiveTools()` and calls `pi.setActiveTools()` to add/remove `process_barrier`. Tools outside the active set are excluded from the model's schema — this is what hides the tool while idle.
+- **Registered at session start (eagerly)**: `pi.registerTool()` runs once at factory init. Registration must happen before any subagent spawns: pi-subagents validates each agent's frontmatter `tools:` allowlist against *registered* tools, and agents that list `barrier` (`delegate`, `oracle`, `scout`, `worker`, `worker-full`) would fail to spawn with "requested unavailable child tools" without it. Injected `toolCall`s also resolve by name only while the tool is registered.
+- **Active-set toggle**: the extension reads `pi.getActiveTools()` and calls `pi.setActiveTools()` to add/remove `barrier`. Tools outside the active set are excluded from the model's schema — this is what hides the tool while idle.
 - The toggle is driven purely by **live-process state** (`running`/`terminating`): session-scope listeners on the manager's `processes:changed`/`processes:ended` broadcasts (with an authoritative `processes:request:list` snapshot as fallback) activate the tool while any process is live and hide it once none are; the `message_end` handler re-asserts the same from its own snapshot, and `execute()` re-hides it in a `finally` when a wait ends.
-- **While idle the tool is invisible to models** (absent from the model's callable schema / system prompt), so models cannot call `process_barrier` ad hoc; the direct-call guard remains purely as a safety net.
+- **While idle the tool is invisible to models** (absent from the model's callable schema / system prompt), so models cannot call `barrier` ad hoc; the direct-call guard remains purely as a safety net.
 
 ## History scrubbing
 
@@ -35,18 +35,18 @@ Deactivation keeps the tool out of the model's schema, but a model that once *sa
 
 ## Call provenance
 
-The extension also blocks **model-authored** `process_barrier` calls before they can execute, so even an attempted call produces no real barrier wait and no history entry the model sees:
+The extension also blocks **model-authored** `barrier` calls before they can execute, so even an attempted call produces no real barrier wait and no history entry the model sees:
 
-- The pi `tool_call` event fires before every tool executes and can block a call with `{ block: true, reason }`. The extension records the id of every call it **injects** (`injectedBarrierCallIds`) and allows only those. Any other `process_barrier` call id is model-authored, and while an injected wait is genuinely in flight (`currentBarrierCallId` set) it is **blocked** with the same internal-helper message the direct-call guard uses — the tool's `execute()` never runs, so no wait starts and no duplicate watch is created.
+- The pi `tool_call` event fires before every tool executes and can block a call with `{ block: true, reason }`. The extension records the id of every call it **injects** (`injectedBarrierCallIds`) and allows only those. Any other `barrier` call id is model-authored and is **blocked unconditionally**, with the same internal-helper message the direct-call guard uses — whether or not an injected wait is currently in flight. The tool's `execute()` never runs, so no wait starts and no duplicate watch is created.
 - A blocked call still surfaces as an error `toolResult` in the stored session (the agent loop preflights calls and turns a block into an immediate error result). The extension records blocked ids (`blockedBarrierCallIds`) on `tool_result` and the context scrub hides them too, so **the model never sees its own attempted call in the messages sent to it** — no result, no history entry.
-- **Reload-safe**: when no injected wait is in flight (`currentBarrierCallId` undefined) an unrecorded id is allowed through and the existing `execute()` direct-call guard rejects it consistently with idle behavior. Injected ids are always recorded at injection (before the loop executes the call), so a fresh session never sees a genuine injected call rejected.
+- **No legitimate unrecorded case exists**: registration and injection are per-session, and an injected id is always recorded in `injectedBarrierCallIds` *before* the agent loop executes that call — so an unrecorded id is by definition model-authored and is always blocked. The `execute()` direct-call guard remains only as a last-resort safety net.
 
 ## Mechanism
 
 - pi-subagents children are in-process `AgentSession`s (`mode: "print"`). The parent only computes a terminal stop from the **relayed** child `message_end`, and only arms its settle-drain (`1s` grace → abort → `3s` hard finish → `dispose` → `session_shutdown` → `@aliou`'s cleanup `killAll()`) when the final assistant message has **no tool calls**.
 - The `message_end` extension handler runs **before** the relay, so injecting a toolCall makes the parent see `hasToolCall = true` → the drain **never arms** → no abort, no dispose, no `killAll()` → child and processes survive.
 - Tool calls resolve **by name with no provenance check**, so the injected call executes like any normal call.
-- **Visibility is separate from resolvability**: the tool is added to the *active tool set* (what the model sees) only while processes run, but injected calls resolve by name as long as the tool is registered and the agent's `tools:` allowlist keeps `process_barrier` listed.
+- **Visibility is separate from resolvability**: the tool is added to the *active tool set* (what the model sees) only while processes run, but injected calls resolve by name as long as the tool is registered and the agent's `tools:` allowlist keeps `barrier` listed.
 - `execute()` blocks using the shared extension event bus: `processes:request:list` to snapshot/refresh, `processes:ended` (and `processes:changed`) broadcast notifications, a 2.5s polling safety net, and a timeout defaulting to 600s (max 1800s).
 - On completion the loop emits the automatic follow-up LLM call — that **is** the wake-up reaction.
 - If a configurable check-in interval elapses while processes still run, the barrier resolves early with a *checkpoint* result (no `terminate: true`), the agent is woken to verify nothing is hanging, and when it ends its turn the barrier is re-injected for a fresh wait (resolve-and-reinject). Exactly one LLM call per check-in; the drain can never arm anywhere in the cycle.
@@ -77,8 +77,8 @@ pi exposes no settings API to extensions; the extension reads the settings.json 
 
 - The extension lives in its own git repo: `~/Projects/pi-process-barrier/process-barrier.ts`.
 - It is symlinked into pi's extension dir: `/Users/mimi/.pi/agent/extensions/process-barrier.ts -> /Users/mimi/Projects/pi-process-barrier/process-barrier.ts`, so edits in the repo take effect on the next pi reload/restart (no config change needed).
-- Five agents have the extension path in their frontmatter `extensions:` line **and** `process_barrier` in their `tools:` allowlist: `delegate`, `oracle`, `scout`, `worker`, `worker-full`. **Keep `process_barrier` listed**: resolvability is governed by the allowlist (an unlisted injected tool resolves to "Tool not found" and the run would settle), while *visibility* is governed by the active-set toggle in [Dynamic availability](#dynamic-availability) — the tool stays hidden from the schema while idle, but must remain resolvable for injected calls while processes run.
-- The main agent is enabled via `parent-tools-lockdown.ts`, which now lists **only `subagent`** (`setActiveTools(["subagent"])`); `process_barrier` is no longer hard-listed there (separate change) — the parent has no `process` tool anyway, and the barrier manages its own visibility.
+- Five agents have the extension path in their frontmatter `extensions:` line **and** `barrier` in their `tools:` allowlist: `delegate`, `oracle`, `scout`, `worker`, `worker-full`. **Keep `barrier` listed**: resolvability is governed by the allowlist (an unlisted injected tool resolves to "Tool not found" and the run would settle), while *visibility* is governed by the active-set toggle in [Dynamic availability](#dynamic-availability) — the tool stays hidden from the schema while idle, but must remain resolvable for injected calls while processes run.
+- The main agent is enabled via `parent-tools-lockdown.ts`, which now lists **only `subagent`** (`setActiveTools(["subagent"])`); `barrier` is no longer hard-listed there (separate change) — the parent has no `process` tool anyway, and the barrier manages its own visibility.
 - `reviewer.md` is intentionally excluded — it has no `process` tool, so processes cannot run there.
 - Restart/reload pi after editing the extension for new sessions to pick it up.
 

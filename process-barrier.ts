@@ -12,7 +12,7 @@
  *   3s hard finish -> dispose -> session_shutdown -> @aliou cleanup killAll()).
  *   The drain arms only when the final assistant message has NO tool calls
  *   (`stopReason === "stop" && !hasToolCall`).
- * - This extension registers a blocking tool named `process_barrier` EAGERLY
+ * - This extension registers a blocking tool named `barrier` EAGERLY
  *   at session start (registration is required for subagent spawn preflight
  *   and for by-name resolution of injected calls) but toggles its ACTIVE
  *   tool-set membership so it is present in the model's callable schema ONLY
@@ -109,10 +109,10 @@ function readEnvInt(name: string, fallback: number): number {
   }
 }
 
-const BARRIER_TOOL_NAME = "process_barrier";
+const BARRIER_TOOL_NAME = "barrier";
 
 /**
- * Session-scoped id-set of process_barrier toolCall ids INJECTED by this
+ * Session-scoped id-set of barrier toolCall ids INJECTED by this
  * extension (never removed: it records provenance for the session's lifetime,
  * so a block decision never depends on the retire/context-scrub lifecycle).
  * The loader re-evaluates this module per session (jiti moduleCache: false),
@@ -121,7 +121,7 @@ const BARRIER_TOOL_NAME = "process_barrier";
 const injectedBarrierCallIds = new Set<string>();
 
 /**
- * Session-scoped id-set of BLOCKED (model-authored) process_barrier call ids.
+ * Session-scoped id-set of BLOCKED (model-authored) barrier call ids.
  * A blocked call produces an error toolResult with no barrier execution; these
  * ids are hidden from the model-visible context by the context filter below so
  * the model never sees evidence of its attempt. Not evicted for the session.
@@ -175,7 +175,7 @@ function retireCurrentBarrier(): void {
 }
 
 const DIRECT_CALL_ERROR_MESSAGE =
-  "process_barrier is an internal helper: it only waits for processes started with the process tool. " +
+  "barrier is an internal helper: it only waits for processes started with the process tool. " +
   "There are currently no running processes, so there is nothing to wait for. Do not call it directly.";
 
 /** Minimal structural view of the @aliou/pi-processes ProcessInfo payload. */
@@ -528,9 +528,9 @@ export default function (pi: ExtensionAPI): void {
   // ensureRegistered call below) — not lazily. It must be in the
   // registered-tool list before any subagent can spawn: pi-subagents validates
   // each agent's frontmatter `tools:` allowlist against REGISTERED tools, and
-  // the agents that list process_barrier (delegate/worker/scout/oracle/
+  // the agents that list barrier (delegate/worker/scout/oracle/
   // worker-full) would fail to spawn with "Agent 'x' requested unavailable
-  // child tools: process_barrier" if it were missing. It must also be
+  // child tools: barrier" if it were missing. It must also be
   // registered for auto-injected toolCalls to resolve by name. Visibility is
   // governed separately by the active-set toggle: the tool is only ACTIVE
   // while processes are running. The loader re-evaluates this module per
@@ -816,19 +816,25 @@ export default function (pi: ExtensionAPI): void {
     }
   });
 
-  // Block MODEL-AUTHORED process_barrier calls before they can execute.
+  // Block MODEL-AUTHORED barrier calls before they can execute.
   // Tool calls are preflighted (agent-loop prepareToolCall) before the tool's
   // execute() runs; extending the pi `tool_call` event here can block a call
-  // with { block: true, reason }. Only the id the extension itself injected
-  // (recorded in injectedBarrierCallIds) may run the real wait. Any other id
-  // is model-authored (the LLM imitating the tool it briefly saw) and is
-  // blocked while an injected wait is genuinely in flight — the tool never
-  // executes, no wait starts, no duplicate watch is created. Reload safety:
-  // when currentBarrierCallId is undefined (no injected wait in flight) an
-  // unrecorded id is ALLOWED through — the existing execute() internal-helper
-  // guard rejects it consistently with idle behavior, covering any edge where
-  // a legitimately injected id was lost across an extension reload. Never
-  // throws; a block failure must not break the turn.
+  // with { block: true, reason } (ToolCallEventResult, types.d.ts:778-782).
+  // Only the id the extension itself injected (recorded in
+  // injectedBarrierCallIds) may run the real wait. Any other id is
+  // model-authored (the LLM imitating the tool it briefly saw) and is blocked
+  // UNCONDITIONALLY: registration and injection are per-session, and the
+  // injected id is ALWAYS recorded (injectedBarrierCallIds.add in the
+  // message_end handler) BEFORE the agent loop executes that call — so an
+  // unrecorded id is by definition not ours, and there is no legitimate
+  // unrecorded case to allow through (no reload edge: the loader re-evaluates
+  // this module per session and injection always records first). The tool
+  // never executes, no wait starts, no duplicate watch is created. A blocked
+  // call leaves an immediate error toolResult; the tool_result tracker below
+  // records its id and the context filter hides it, so the model never sees
+  // evidence of its own attempt. The execute() guard remains only as a
+  // last-resort safety net. Never throws; a block failure must not break the
+  // turn.
   pi.on("tool_call", (event) => {
     try {
       const e = event as { toolName?: unknown; toolCallId?: unknown } | null;
@@ -837,11 +843,7 @@ export default function (pi: ExtensionAPI): void {
       if (id === "") return undefined;
       // Provenance: only extension-injected calls may run the wait.
       if (injectedBarrierCallIds.has(id)) return undefined;
-      if (currentBarrierCallId !== undefined) {
-        return { block: true, reason: DIRECT_CALL_ERROR_MESSAGE };
-      }
-      // No injected wait in flight: let the existing execute() guard handle it.
-      return undefined;
+      return { block: true, reason: DIRECT_CALL_ERROR_MESSAGE };
     } catch {
       return undefined;
     }
@@ -879,7 +881,7 @@ export default function (pi: ExtensionAPI): void {
 
   // Fired before EVERY LLM call (first of a turn AND every follow-up after
   // tool results) with a structuredClone deep copy of the exact messages about
-  // to be sent. Strip RETIRED process_barrier invocations (their toolCall
+  // to be sent. Strip RETIRED barrier invocations (their toolCall
   // blocks and matching toolResult messages) so the model never sees a past
   // barrier call in history and cannot imitate it. The CURRENT invocation
   // stays visible: the immediate wake-up follow-up call reads the wait summary
