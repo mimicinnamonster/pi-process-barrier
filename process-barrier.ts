@@ -12,13 +12,17 @@
  *   3s hard finish -> dispose -> session_shutdown -> @aliou cleanup killAll()).
  *   The drain arms only when the final assistant message has NO tool calls
  *   (`stopReason === "stop" && !hasToolCall`).
- * - This extension registers a blocking tool named `process_barrier` and, on
- *   `message_end` for a terminal assistant message, INJECTS a synthetic
- *   toolCall for it into that message (in-place) whenever processes are still
- *   running. Because the agent loop re-reads message.content AFTER extension
- *   handlers run and resolves tool calls by name with no provenance check,
- *   the injected call executes like any other: `hasToolCall` is true at the
- *   relay, so the parent never arms the settle-drain and the child survives.
+ * - This extension registers a blocking tool named `process_barrier` EAGERLY
+ *   at session start (registration is required for subagent spawn preflight
+ *   and for by-name resolution of injected calls) but toggles its ACTIVE
+ *   tool-set membership so it is present in the model's callable schema ONLY
+ *   exactly while processes are running; on `message_end` for a terminal
+ *   assistant message it INJECTS a synthetic toolCall for the tool into that
+ *   message (in-place) whenever processes are still running. Because the agent
+ *   loop re-reads message.content AFTER extension handlers run and resolves
+ *   tool calls by name with no provenance check, the injected call executes
+ *   like any other: `hasToolCall` is true at the relay, so the parent never
+ *   arms the settle-drain and the child survives.
  * - The barrier tool's `execute()` BLOCKS (keeps the turn's tool batch open)
  *   until every watched process exits (or the timeout passes), then returns a
  *   summary as its tool_result. The loop's automatic follow-up LLM call is
@@ -27,11 +31,16 @@
  *   running, the run completes normally (the killAll() cleanup at dispose is
  *   harmless because nothing is left running).
  *
- * Guard: the tool is deliberately NOT callable as a general utility. If an
- * agent calls it directly while no processes are running, execute() THROWS so
- * the LLM sees an error result telling it not to call directly. It has no
- * promptSnippet, so it is omitted from the "Available tools" system-prompt
- * section (custom tools only appear there when a snippet is provided).
+ * Guard: the tool is deliberately NOT callable as a general utility. It is
+ * registered at session start (so the spawn preflight passes for agents whose
+ * `tools:` allowlist includes it and injected calls can resolve) but is absent
+ * from the ACTIVE tool set while no processes are running — and therefore
+ * excluded from the model's function-calling schema. If an agent nevertheless
+ * calls it directly
+ * while no processes are running, execute() THROWS so the LLM sees an error
+ * result telling it not to call directly. It has no promptSnippet, so it is
+ * omitted from the "Available tools" system-prompt section (custom tools only
+ * appear there when a snippet is provided).
  */
 
 import { readFileSync } from "node:fs";
@@ -101,6 +110,69 @@ function readEnvInt(name: string, fallback: number): number {
 }
 
 const BARRIER_TOOL_NAME = "process_barrier";
+
+/**
+ * Session-scoped id-set of process_barrier toolCall ids INJECTED by this
+ * extension (never removed: it records provenance for the session's lifetime,
+ * so a block decision never depends on the retire/context-scrub lifecycle).
+ * The loader re-evaluates this module per session (jiti moduleCache: false),
+ * so this never leaks across sessions.
+ */
+const injectedBarrierCallIds = new Set<string>();
+
+/**
+ * Session-scoped id-set of BLOCKED (model-authored) process_barrier call ids.
+ * A blocked call produces an error toolResult with no barrier execution; these
+ * ids are hidden from the model-visible context by the context filter below so
+ * the model never sees evidence of its attempt. Not evicted for the session.
+ */
+const blockedBarrierCallIds = new Set<string>();
+
+// Session-scoped one-shot registration guard. The loader re-evaluates this
+// module per session (jiti moduleCache: false), so this flag never leaks
+// across sessions: the tool is registered at most once per session, eagerly
+// at factory init.
+let registered = false;
+
+// History-scrub bookkeeping, also session-scoped (same re-evaluation rule as
+// `registered`). A barrier wait's toolCall/toolResult pair must stay visible
+// to the immediate wake-up follow-up LLM call (that call reads the process
+// summary from the toolResult). The pair is SERVED as soon as it is shown to
+// that call (a context projection) and RETIRED the moment the wake-up call's
+// assistant message is finalized (message_end), so any later LLM call —
+// further calls within the same turn or later turns — never sees it. The
+// message_start(user) and new-injection retire paths remain as idempotent
+// safety nets. Retired pairs are stripped from the model-visible context on
+// every subsequent LLM call via the pi context event, so the model never sees
+// a past barrier invocation in history and cannot imitate it.
+let currentBarrierCallId: string | undefined;
+const retiredBarrierCallIds = new Set<string>();
+
+/**
+ * The invocation that has already been shown to the wake-up follow-up LLM
+ * call via a context projection but whose assistant message has not yet been
+ * finalized. From that message's message_end it is retired immediately, so
+ * later LLM calls never see it. Always equals currentBarrierCallId while set
+ * (set in the context handler, cleared by retireId).
+ */
+let servedBarrierCallId: string | undefined;
+
+/**
+ * Move an id to the hidden set and drop it from the current/served slot(s).
+ * Idempotent (Set.add dedupes); safe for undefined; clears both references to
+ * the id so a retired invocation can never be re-served or re-injected.
+ */
+function retireId(id: string | undefined): void {
+  if (id === undefined) return;
+  retiredBarrierCallIds.add(id);
+  if (currentBarrierCallId === id) currentBarrierCallId = undefined;
+  if (servedBarrierCallId === id) servedBarrierCallId = undefined;
+}
+
+/** Retire the current active invocation (if any): it moves to the hidden set. */
+function retireCurrentBarrier(): void {
+  retireId(currentBarrierCallId);
+}
 
 const DIRECT_CALL_ERROR_MESSAGE =
   "process_barrier is an internal helper: it only waits for processes started with the process tool. " +
@@ -174,6 +246,27 @@ function requestList(pi: ExtensionAPI): Promise<ProcessInfo[]> {
     }
     setTimeout(() => finish([]), LIST_FALLBACK_MS);
   });
+}
+
+/**
+ * Add/remove the barrier tool from the session's ACTIVE tool set. Tools outside
+ * the active set are excluded from the model's function-calling schema, so this
+ * is what keeps the tool invisible to models except exactly while processes are
+ * running. Idempotent; never throws (action methods may still be unbound during
+ * extension load, and a failed toggle must never break a turn or the relay).
+ */
+function setBarrierActive(pi: ExtensionAPI, on: boolean): void {
+  try {
+    const active = pi.getActiveTools();
+    const has = active.includes(BARRIER_TOOL_NAME);
+    if (on && !has) {
+      pi.setActiveTools([...active, BARRIER_TOOL_NAME]);
+    } else if (!on && has) {
+      pi.setActiveTools(active.filter((n) => n !== BARRIER_TOOL_NAME));
+    }
+  } catch {
+    // Never throw.
+  }
 }
 
 function toReportEntry(p: ProcessInfo): ReportEntry {
@@ -431,88 +524,211 @@ export default function (pi: ExtensionAPI): void {
     MAX_TIMEOUT_SECONDS,
   );
 
-  pi.registerTool({
-    name: BARRIER_TOOL_NAME,
-    label: "Wait for Processes",
-    description:
-      "Blocks until all processes started with the process tool have exited, then reports their final statuses. " +
-      "It is automatically injected when your turn ends while processes are still running, so you will be woken with the results. " +
-      "If a configurable check-in interval has elapsed while processes still run, you will be woken periodically to verify processes aren't hanging; " +
-      "it is safe to keep your turn short (check process list/output, decide, end your turn) and the barrier will continue waiting. " +
-      "The interval is configurable in pi settings (processBarrier.checkIntervalSeconds; 0 disables periodic check-ins). " +
-      "Do not call it directly unless you deliberately want to block until processes finish; if no processes are running it will error.",
-    // No promptSnippet: custom tools without one are omitted from the
-    // "Available tools" section of the default system prompt (verified in
-    // dist/core/system-prompt.js). The tool is auto-injected, not meant for
-    // ad-hoc use.
-    parameters: BarrierParams,
-    async execute(
-      _toolCallId: string,
-      params: Static<typeof BarrierParams>,
-      signal?: AbortSignal,
-    ) {
-      const all = await requestList(pi);
-      const running = all.filter(
-        (p) => p && typeof p.id === "string" && isLive(p.status),
-      );
-      if (running.length === 0) {
-        // The agent (or anything else) called this tool directly with nothing
-        // to wait for. Throw -> the agent loop encodes it as an error tool
-        // result so the LLM sees the message above instead of a fake success.
-        throw new Error(DIRECT_CALL_ERROR_MESSAGE);
-      }
+  // The barrier tool is registered EAGERLY at factory init (see the
+  // ensureRegistered call below) — not lazily. It must be in the
+  // registered-tool list before any subagent can spawn: pi-subagents validates
+  // each agent's frontmatter `tools:` allowlist against REGISTERED tools, and
+  // the agents that list process_barrier (delegate/worker/scout/oracle/
+  // worker-full) would fail to spawn with "Agent 'x' requested unavailable
+  // child tools: process_barrier" if it were missing. It must also be
+  // registered for auto-injected toolCalls to resolve by name. Visibility is
+  // governed separately by the active-set toggle: the tool is only ACTIVE
+  // while processes are running. The loader re-evaluates this module per
+  // session (jiti moduleCache: false), so the module-level `registered` flag
+  // is session-scoped and the tool is registered at most once per session.
+  const ensureRegistered = (currentPi: ExtensionAPI): void => {
+    if (registered) return;
+    try {
+      currentPi.registerTool({
+        name: BARRIER_TOOL_NAME,
+        label: "Wait for Processes",
+        description:
+          "Blocks until all processes started with the process tool have exited, then reports their final statuses. " +
+          "It is automatically injected when your turn ends while processes are still running, so you will be woken with the results. " +
+          "If a configurable check-in interval has elapsed while processes still run, you will be woken periodically to verify processes aren't hanging; " +
+          "it is safe to keep your turn short (check process list/output, decide, end your turn) and the barrier will continue waiting. " +
+          "The interval is configurable in pi settings (processBarrier.checkIntervalSeconds; 0 disables periodic check-ins). " +
+          "Do not call it directly unless you deliberately want to block until processes finish; if no processes are running it will error.",
+        // No promptSnippet: custom tools without one are omitted from the
+        // "Available tools" section of the default system prompt (verified in
+        // dist/core/system-prompt.js). The tool is auto-injected, not meant for
+        // ad-hoc use.
+        parameters: BarrierParams,
+        async execute(
+          _toolCallId: string,
+          params: Static<typeof BarrierParams>,
+          signal?: AbortSignal,
+        ) {
+          const all = await requestList(pi);
+          const running = all.filter(
+            (p) => p && typeof p.id === "string" && isLive(p.status),
+          );
+          if (running.length === 0) {
+            // The agent (or anything else) called this tool directly with nothing
+            // to wait for. Throw -> the agent loop encodes it as an error tool
+            // result so the LLM sees the message above instead of a fake success.
+            throw new Error(DIRECT_CALL_ERROR_MESSAGE);
+          }
 
-      const timeoutSeconds = Math.min(
-        Math.max(params.timeoutSeconds ?? defaultTimeoutSeconds, 1),
-        MAX_TIMEOUT_SECONDS,
-      );
-      const effCheckIntervalSeconds = Math.max(
-        params.checkIntervalSeconds ?? checkIntervalSeconds,
-        0,
-      );
-      const waitStartedAt = Date.now();
-      const deadline = Date.now() + timeoutSeconds * 1000;
+          const timeoutSeconds = Math.min(
+            Math.max(params.timeoutSeconds ?? defaultTimeoutSeconds, 1),
+            MAX_TIMEOUT_SECONDS,
+          );
+          const effCheckIntervalSeconds = Math.max(
+            params.checkIntervalSeconds ?? checkIntervalSeconds,
+            0,
+          );
+          const waitStartedAt = Date.now();
+          const deadline = Date.now() + timeoutSeconds * 1000;
+          console.error(
+            `[process-barrier] waiting for ${running.length} process(es): ${running.map((p) => p.id).join(", ")} (timeout ${timeoutSeconds}s, check-in ${effCheckIntervalSeconds}s)`,
+          );
+
+          try {
+            const { entries, checkpoint } = await waitForAllExited(
+              pi,
+              running,
+              deadline,
+              signal,
+              effCheckIntervalSeconds > 0
+                ? effCheckIntervalSeconds * 1000
+                : 0,
+            );
+            if (checkpoint) {
+              const elapsedSeconds = Math.max(
+                0,
+                Math.round((Date.now() - waitStartedAt) / 1000),
+              );
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: formatCheckpoint(entries, elapsedSeconds),
+                  },
+                ],
+                details: { checkpoint: true, processes: entries },
+                // Intentionally no `terminate: true`: the follow-up LLM call after
+                // this tool batch is the periodic check-in reaction; when the agent
+                // ends its turn again the barrier is re-injected for a fresh wait.
+              };
+            }
+            const timedOutSeconds = Math.max(
+              0,
+              Math.round((deadline - Date.now()) / 1000),
+            );
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: formatReport(entries, timedOutSeconds),
+                },
+              ],
+              details: { processes: entries },
+              // Intentionally no `terminate: true`: the automatic follow-up LLM
+              // call after this tool batch IS the agent's wake-up reaction.
+            };
+          } finally {
+            // The wait resolved (or was aborted): the barrier is no longer
+            // needed in the model's schema. Any still-running processes
+            // re-activate it on the next process event or message_end.
+            setBarrierActive(pi, false);
+          }
+        },
+      });
+      registered = true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
       console.error(
-        `[process-barrier] waiting for ${running.length} process(es): ${running.map((p) => p.id).join(", ")} (timeout ${timeoutSeconds}s, check-in ${effCheckIntervalSeconds}s)`,
+        `[process-barrier] failed to register ${BARRIER_TOOL_NAME}: ${message}`,
       );
+    }
+  };
 
-      const { entries, checkpoint } = await waitForAllExited(
-        pi,
-        running,
-        deadline,
-        signal,
-        effCheckIntervalSeconds > 0 ? effCheckIntervalSeconds * 1000 : 0,
-      );
-      if (checkpoint) {
-        const elapsedSeconds = Math.max(
-          0,
-          Math.round((Date.now() - waitStartedAt) / 1000),
-        );
-        return {
-          content: [
-            { type: "text", text: formatCheckpoint(entries, elapsedSeconds) },
-          ],
-          details: { checkpoint: true, processes: entries },
-          // Intentionally no `terminate: true`: the follow-up LLM call after
-          // this tool batch is the periodic check-in reaction; when the agent
-          // ends its turn again the barrier is re-injected for a fresh wait.
-        };
+  // Eager registration at factory init, before any handler registration or
+  // anything else that could throw: the tool must be in the registered-tool
+  // list by the time subagent spawn preflight runs and by the time any
+  // auto-injected toolCall resolves. registerTool() is valid during extension
+  // load (tools refresh happens on bind). Visibility stays inactive here —
+  // only live-process state may add it to the ACTIVE tool set.
+  ensureRegistered(pi);
+
+  // Session start: idempotent safety — the barrier must never start ACTIVE
+  // (i.e. visible in the model's schema). Only live-process state may activate
+  // it. (At the very end of factory init action methods may still be unbound;
+  // this runs once the runtime is bound.)
+  pi.on("session_start", () => {
+    setBarrierActive(pi, false);
+  });
+
+  // Session-scope state listener: keep the barrier's visibility in sync with
+  // live process state on the shared extension event bus (the same channels
+  // used by waitForAllExited). Any live (running|terminating) process makes
+  // the tool ACTIVE; once none are live it is hidden again. (Registration
+  // already happened at factory init; ensureRegistered here is an idempotent
+  // no-op kept for robustness.)
+  const syncBarrierState = (payload: unknown): void => {
+    try {
+      const status = (payload as { status?: unknown } | null)?.status;
+      if (typeof status === "string") {
+        // processes:ended carries a single ProcessInfo with its final status;
+        // processes:started carries one with a live status. Judge by it.
+        if (isLive(status)) {
+          ensureRegistered(pi);
+          setBarrierActive(pi, true);
+        } else {
+          setBarrierActive(pi, false);
+        }
+        return;
       }
-      const timedOutSeconds = Math.max(
-        0,
-        Math.round((deadline - Date.now()) / 1000),
-      );
-      return {
-        content: [{ type: "text", text: formatReport(entries, timedOutSeconds) }],
-        details: { processes: entries },
-        // Intentionally no `terminate: true`: the automatic follow-up LLM
-        // call after this tool batch IS the agent's wake-up reaction.
-      };
-    },
+      // processes:changed carries only { reason: "started"|"ended"|"cleared" } —
+      // no process data. Fall back to an authoritative list snapshot.
+      void requestList(pi).then((list) => {
+        const live = list.some(
+          (p) => p && typeof p.id === "string" && isLive(p.status),
+        );
+        if (live) {
+          ensureRegistered(pi);
+          setBarrierActive(pi, true);
+        } else {
+          setBarrierActive(pi, false);
+        }
+      });
+    } catch {
+      // Never throw from an event handler.
+    }
+  };
+  const stateListeners: Array<() => void> = [
+    pi.events.on("processes:changed", (payload) => {
+      syncBarrierState(payload);
+    }),
+    pi.events.on("processes:ended", (payload) => {
+      syncBarrierState(payload);
+    }),
+  ];
+  pi.on("session_shutdown", () => {
+    for (const unsub of stateListeners) {
+      try {
+        unsub();
+      } catch {
+        // Never throw during shutdown.
+      }
+    }
   });
 
   pi.on("message_end", async (event, ctx) => {
     try {
+      // A served invocation is retired as soon as the wake-up LLM call's
+      // assistant message is finalized — message_end fires for every persisted
+      // assistant message (including ones containing further tool calls), so
+      // this runs before any LATER LLM call in the same turn (or a later turn)
+      // can see the pair. It is a no-op on other message_ends (the barrier's
+      // toolResult persistence, the final message that carried the injection):
+      // servedBarrierCallId stays undefined until the context handler below
+      // has served the pair, so the wake-up call itself still reads the
+      // process summary.
+      if (servedBarrierCallId !== undefined) {
+        retireId(servedBarrierCallId);
+      }
       const m = event?.message as {
         role?: string;
         stopReason?: string;
@@ -540,8 +756,23 @@ export default function (pi: ExtensionAPI): void {
       const running = all.filter(
         (p) => p && typeof p.id === "string" && isLive(p.status),
       );
-      if (running.length === 0 || !Array.isArray(m.content)) {
-        return; // nothing to wait for — no overhead
+      if (running.length === 0) {
+        // Nothing to wait for: hide the barrier from the model's schema so it
+        // cannot be called ad hoc while idle (authoritative re-check after any
+        // earlier wait resolved).
+        setBarrierActive(pi, false);
+        return;
+      }
+
+      // A process is still running: make the barrier ACTIVE so the injected
+      // toolCall resolves by name and the model can call it. (Registration
+      // already happened at factory init; ensureRegistered is an idempotent
+      // no-op.)
+      ensureRegistered(pi);
+      setBarrierActive(pi, true);
+
+      if (!Array.isArray(m.content)) {
+        return; // cannot inject a toolCall into non-array content
       }
 
       // Inject a synthetic toolCall for the barrier tool. The agent loop
@@ -556,6 +787,15 @@ export default function (pi: ExtensionAPI): void {
         arguments: {},
       };
       m.content.push(toolCall as never);
+      // A new injected barrier call supersedes any previous one (only one
+      // barrier runs at a time): retire the old pair, then mark the new
+      // invocation as the CURRENT one (visible to the wake-up follow-up call).
+      retireCurrentBarrier();
+      currentBarrierCallId = toolCall.id;
+      // Record provenance AFTER retiring the previous invocation: the injected
+      // id must be recognizable as ours for the tool_call block handler and
+      // stay recorded even after the pair is retired from the context scrub.
+      injectedBarrierCallIds.add(toolCall.id);
       console.error(
         `[process-barrier] injected ${BARRIER_TOOL_NAME} for ${running.length} running process(es): ${running.map((p) => p.id).join(", ")} (check-in ${checkIntervalSeconds}s)`,
       );
@@ -575,4 +815,163 @@ export default function (pi: ExtensionAPI): void {
       }
     }
   });
+
+  // Block MODEL-AUTHORED process_barrier calls before they can execute.
+  // Tool calls are preflighted (agent-loop prepareToolCall) before the tool's
+  // execute() runs; extending the pi `tool_call` event here can block a call
+  // with { block: true, reason }. Only the id the extension itself injected
+  // (recorded in injectedBarrierCallIds) may run the real wait. Any other id
+  // is model-authored (the LLM imitating the tool it briefly saw) and is
+  // blocked while an injected wait is genuinely in flight — the tool never
+  // executes, no wait starts, no duplicate watch is created. Reload safety:
+  // when currentBarrierCallId is undefined (no injected wait in flight) an
+  // unrecorded id is ALLOWED through — the existing execute() internal-helper
+  // guard rejects it consistently with idle behavior, covering any edge where
+  // a legitimately injected id was lost across an extension reload. Never
+  // throws; a block failure must not break the turn.
+  pi.on("tool_call", (event) => {
+    try {
+      const e = event as { toolName?: unknown; toolCallId?: unknown } | null;
+      if (!e || e.toolName !== BARRIER_TOOL_NAME) return undefined;
+      const id = String(e.toolCallId ?? "");
+      if (id === "") return undefined;
+      // Provenance: only extension-injected calls may run the wait.
+      if (injectedBarrierCallIds.has(id)) return undefined;
+      if (currentBarrierCallId !== undefined) {
+        return { block: true, reason: DIRECT_CALL_ERROR_MESSAGE };
+      }
+      // No injected wait in flight: let the existing execute() guard handle it.
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  });
+
+  // A new user turn means any previous barrier wait is done — its summary was
+  // already delivered to the wake-up follow-up LLM call. Retire the current
+  // invocation: on subsequent LLM calls the context handler below strips the
+  // retired pair from the model-visible context.
+  pi.on("message_start", (event) => {
+    try {
+      if (event?.message?.role === "user") retireCurrentBarrier();
+    } catch {
+      // Never throw from an event handler.
+    }
+  });
+
+  // Record a BLOCKED (model-authored) barrier call id so the context scrub
+  // hides its error toolResult and toolCall block from the model: the goal is
+  // that the model never sees evidence it attempted the internal helper.
+  pi.on("tool_result", (event) => {
+    try {
+      const e = event as { toolName?: unknown; toolCallId?: unknown } | null;
+      if (!e || e.toolName !== BARRIER_TOOL_NAME) return;
+      const id = String(e.toolCallId ?? "");
+      if (id === "") return;
+      if (injectedBarrierCallIds.has(id)) return;
+      // Not ours => a model-authored attempt (blocked pre-execution). Mark its
+      // id blocked so the context filter hides its error toolResult.
+      blockedBarrierCallIds.add(id);
+    } catch {
+      // Never throw.
+    }
+  });
+
+  // Fired before EVERY LLM call (first of a turn AND every follow-up after
+  // tool results) with a structuredClone deep copy of the exact messages about
+  // to be sent. Strip RETIRED process_barrier invocations (their toolCall
+  // blocks and matching toolResult messages) so the model never sees a past
+  // barrier call in history and cannot imitate it. The CURRENT invocation
+  // stays visible: the immediate wake-up follow-up call reads the wait summary
+  // from its toolResult, and seeing it here counts as SERVING — the next
+  // message_end retires it, so no later call (same turn or later) can see or
+  // imitate it. The stored session is untouched (pi sessions are append-only —
+  // there is no delete/update entry API). Returning undefined is the no-op;
+  // never throw (the runtime also guards, but we stay defensive).
+  pi.on("context", (event) => {
+    try {
+      if (
+        retiredBarrierCallIds.size === 0 &&
+        currentBarrierCallId === undefined
+      ) {
+        return undefined; // nothing retired, nothing current -> no-op
+      }
+      const messages = event?.messages;
+      if (!Array.isArray(messages)) return undefined;
+      const filtered: Array<typeof messages[number]> = [];
+      for (const m of messages) {
+        const role = (m as { role?: string } | null)?.role;
+        if (
+          role === "toolResult" &&
+          (m as { toolName?: string } | null)?.toolName === BARRIER_TOOL_NAME &&
+          (retiredBarrierCallIds.has(
+            (m as { toolCallId?: string } | null)?.toolCallId as string,
+          ) ||
+            // Blocked (model-authored) calls also surface as error toolResults;
+            // hide them too so the model never sees evidence of its attempt.
+            blockedBarrierCallIds.has(
+              (m as { toolCallId?: string } | null)?.toolCallId as string,
+            ))
+        ) {
+          continue; // drop the retired barrier toolResult
+        }
+        if (role === "assistant" && Array.isArray((m as { content?: unknown }).content)) {
+          const original = (
+            m as {
+              content: Array<{ type?: string; name?: string; id?: string }>;
+            }
+          ).content;
+          const kept = original.filter(
+            (c) =>
+              !(
+                c?.type === "toolCall" &&
+                c?.name === BARRIER_TOOL_NAME &&
+                (retiredBarrierCallIds.has(String(c?.id)) ||
+                  blockedBarrierCallIds.has(String(c?.id)))
+              ),
+          );
+          if (
+            servedBarrierCallId === undefined &&
+            currentBarrierCallId !== undefined &&
+            original.some(
+              (c) =>
+                c?.type === "toolCall" &&
+                c?.name === BARRIER_TOOL_NAME &&
+                String(c?.id) === currentBarrierCallId,
+            )
+          ) {
+            // First time the CURRENT (not yet retired) invocation is shown to
+            // a context projection: it is being served to the wake-up call and
+            // stays visible for THIS call only; the wake-up assistant message's
+            // message_end retires it (served-then-retired). The filter above
+            // already preserved the block (its id is not retired).
+            servedBarrierCallId = currentBarrierCallId;
+          }
+          if (
+            kept.length === 0 &&
+            original.every((c) => c?.type === "toolCall")
+          ) {
+            // Only retired toolCall blocks (no text left): skip the whole
+            // message instead of emitting empty content, which some providers
+            // reject.
+            continue;
+          }
+          filtered.push({ ...(m as object), content: kept } as never);
+          continue;
+        }
+        filtered.push(m);
+      }
+      return { messages: filtered as typeof messages };
+    } catch {
+      // Never throw from a context handler: a failure must not break the LLM
+      // call. Returning undefined leaves the context untouched (no-op).
+      return undefined;
+    }
+  });
+
+  // Very end of factory init: the tool must not start ACTIVE (visible in the
+  // model's schema). When factory init still runs, action methods are unbound
+  // stubs and the helper swallows their throw; session_start repeats this once
+  // the runtime is bound.
+  setBarrierActive(pi, false);
 }
