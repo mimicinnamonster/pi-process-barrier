@@ -17,7 +17,7 @@ A small [pi](https://github.com/earendil-works/pi) extension that keeps pi-subag
 
 The tool is registered for the whole session but only *visible* while needed:
 
-- **Registered at session start (eagerly)**: `pi.registerTool()` runs once at factory init. Registration must happen before any subagent spawns: pi-subagents validates each agent's frontmatter `tools:` allowlist against *registered* tools, and agents that list `barrier` (`delegate`, `oracle`, `scout`, `worker`, `worker-full`) would fail to spawn with "requested unavailable child tools" without it. Injected `toolCall`s also resolve by name only while the tool is registered.
+- **Registered at session start (eagerly)**: `pi.registerTool()` runs once at factory init. Registration must happen before any subagent spawns: pi-subagents validates each agent's frontmatter `tools:` allowlist against *registered* tools, and agents that list `barrier` would fail to spawn with "requested unavailable child tools" without it. Injected `toolCall`s also resolve by name only while the tool is registered.
 - **Active-set toggle**: the extension reads `pi.getActiveTools()` and calls `pi.setActiveTools()` to add/remove `barrier`. Tools outside the active set are excluded from the model's schema — this is what hides the tool while idle.
 - The toggle is driven purely by **live-process state** (`running`/`terminating`): session-scope listeners on the manager's `processes:changed`/`processes:ended` broadcasts (with an authoritative `processes:request:list` snapshot as fallback) activate the tool while any process is live and hide it once none are; the `message_end` handler re-asserts the same from its own snapshot, and `execute()` re-hides it in a `finally` when a wait ends.
 - **While idle the tool is invisible to models** (absent from the model's callable schema / system prompt), so models cannot call `barrier` ad hoc; the direct-call guard remains purely as a safety net.
@@ -53,7 +53,7 @@ The extension also blocks **model-authored** `barrier` calls before they can exe
 
 ## Configuration
 
-The periodic check-in interval (waking the agent to check whether processes are hanging) is configured in **pi settings** at `/Users/mimi/.pi/agent/settings.json` under a top-level `processBarrier` key:
+The periodic check-in interval (waking the agent to check whether processes are hanging) is configured in **pi settings** at `~/.pi/agent/settings.json` under a top-level `processBarrier` key:
 
 ```jsonc
 {
@@ -75,11 +75,11 @@ pi exposes no settings API to extensions; the extension reads the settings.json 
 
 ## Install / wiring
 
-- The extension lives in its own git repo: `~/Projects/pi-process-barrier/process-barrier.ts`.
-- It is symlinked into pi's extension dir: `/Users/mimi/.pi/agent/extensions/process-barrier.ts -> /Users/mimi/Projects/pi-process-barrier/process-barrier.ts`, so edits in the repo take effect on the next pi reload/restart (no config change needed).
-- Five agents have the extension path in their frontmatter `extensions:` line **and** `barrier` in their `tools:` allowlist: `delegate`, `oracle`, `scout`, `worker`, `worker-full`. **Keep `barrier` listed**: resolvability is governed by the allowlist (an unlisted injected tool resolves to "Tool not found" and the run would settle), while *visibility* is governed by the active-set toggle in [Dynamic availability](#dynamic-availability) — the tool stays hidden from the schema while idle, but must remain resolvable for injected calls while processes run.
-- The main agent is enabled via `parent-tools-lockdown.ts`, which now lists **only `subagent`** (`setActiveTools(["subagent"])`); `barrier` is no longer hard-listed there (separate change) — the parent has no `process` tool anyway, and the barrier manages its own visibility.
-- `reviewer.md` is intentionally excluded — it has no `process` tool, so processes cannot run there.
+- Keep the extension in a git checkout; this guide assumes `~/Projects/pi-process-barrier/process-barrier.ts` (any path works).
+- Symlink it into pi's extension dir: `~/.pi/agent/extensions/process-barrier.ts -> ~/Projects/pi-process-barrier/process-barrier.ts`, so edits in the checkout take effect on the next pi reload/restart (no config change needed).
+- Every agent that should run processes needs the extension path in its frontmatter `extensions:` line **and** `barrier` in its `tools:` allowlist. **Keep `barrier` listed**: resolvability is governed by the allowlist (an unlisted injected tool resolves to "Tool not found" and the run would settle), while *visibility* is governed by the active-set toggle in [Dynamic availability](#dynamic-availability) — the tool stays hidden from the schema while idle, but must remain resolvable for injected calls while processes run.
+- Do not hard-list `barrier` in an active-tool lockdown that the parent agent applies (e.g. `setActiveTools(["subagent"])`): the parent has no `process` tool anyway, and the barrier manages its own visibility.
+- Agents without a `process` tool should be excluded — processes cannot run there, so there is nothing for the barrier to wait on.
 - Restart/reload pi after editing the extension for new sessions to pick it up.
 
 ## Known caveats
