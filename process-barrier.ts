@@ -5,59 +5,112 @@
  * @aliou/pi-processes extension) are still running, and gives the agent a
  * reaction turn when they finish.
  *
- * Mechanism (verified against installed sources):
- * - pi-subagents children are in-process AgentSessions (mode "print"). The
- *   parent computes `terminalAssistantStop` ONLY from the RELAYED child
- *   `message_end` event and then arms a settle-drain (1s grace -> abort ->
- *   3s hard finish -> dispose -> session_shutdown -> @aliou cleanup killAll()).
- *   The drain arms only when the final assistant message has NO tool calls
- *   (`stopReason === "stop" && !hasToolCall`).
- * - This extension registers a blocking tool named `barrier` EAGERLY
- *   at session start (registration is required for subagent spawn preflight
- *   and for by-name resolution of injected calls) but toggles its ACTIVE
- *   tool-set membership so it is present in the model's callable schema ONLY
- *   exactly while processes are running; on `message_end` for a terminal
- *   assistant message it INJECTS a synthetic toolCall for the tool into that
- *   message (in-place) whenever processes are still running. Because the agent
- *   loop re-reads message.content AFTER extension handlers run and resolves
- *   tool calls by name with no provenance check, the injected call executes
- *   like any other: `hasToolCall` is true at the relay, so the parent never
- *   arms the settle-drain and the child survives.
- * - The barrier tool's `execute()` BLOCKS (keeps the turn's tool batch open)
- *   until every watched process exits (or the timeout passes), then returns a
- *   summary as its tool_result. The loop's automatic follow-up LLM call is
- *   the agent's reaction: with the summary in context it reports, retries, or
- *   starts more processes. When it finally ends its turn with nothing left
- *   running, the run completes normally (the killAll() cleanup at dispose is
- *   harmless because nothing is left running).
+ * Mechanism (verified against installed pi sources and proven end-to-end by
+ * the poc-block-wait experiment):
+ * - pi-subagents children are in-process AgentSessions. The parent decides an
+ *   early settle from the child's RELAYED `message_end` event: when the final
+ *   assistant message has no tool calls (`stopReason === "stop"`), a settle
+ *   drain is armed (grace -> abort -> hard finish -> session_shutdown ->
+ *   @aliou cleanup killAll()).
+ * - pi core AWAITS extension event handlers before forwarding the event to
+ *   public listeners (dist/core/agent-session.js), and pi-subagents is such a
+ *   public listener. A BLOCKING `message_end` handler therefore defers the
+ *   settle decision for as long as the handler runs.
+ * - On a terminal assistant message, this extension checks the process
+ *   manager for live processes. If any are running, the handler BLOCKS until
+ *   every one of them exits (event-driven wake via `processes:ended`, with a
+ *   poll safety net), then queues a report as a follow-up user message
+ *   (sendUserMessage(..., { deliverAs: "followUp" })). That message forces a
+ *   reaction LLM turn in which the agent reports the results; when it ends
+ *   its turn with nothing left running, the handler is a fast no-op and the
+ *   run settles normally.
  *
- * Guard: the tool is deliberately NOT callable as a general utility. It is
- * registered at session start (so the spawn preflight passes for agents whose
- * `tools:` allowlist includes it and injected calls can resolve) but is absent
- * from the ACTIVE tool set while no processes are running — and therefore
- * excluded from the model's function-calling schema. If an agent nevertheless
- * calls it directly
- * while no processes are running, execute() THROWS so the LLM sees an error
- * result telling it not to call directly. It has no promptSnippet, so it is
- * omitted from the "Available tools" system-prompt section (custom tools only
- * appear there when a snippet is provided).
+ * Why no registered tool: the previous design registered a blocking tool and
+ * injected a synthetic toolCall for it into the final assistant message. That
+ * required the tool to exist in every child's `tools:` allowlist (spawn
+ * preflight + by-name resolution), which leaked the tool's name and schema
+ * into the model's world — weak models then called it directly. The
+ * allowlist cannot be bypassed (strict registry filter; injected calls
+ * resolve only against the active toolset), so the tool approach is
+ * unfixable at the extension level. This design registers NOTHING: there is
+ * no tool name to leak, no allowlist coupling, and nothing for a model to
+ * call or imitate. Leak-free by construction.
+ *
+ * Periodic check-ins: while processes keep running, the wait can resolve
+ * early every `checkIntervalSeconds` (default 120, 0 disables) to wake the
+ * agent for a health check. This is also the liveness signal on long holds:
+ * each check-in is real LLM activity, which resets pi-subagents' activity
+ * tracking. The next terminal message re-enters the wait.
+ *
+ * Abort: the handler honors the session abort signal (ctx.getSignal()); on
+ * abort it stops waiting immediately and does NOT queue a follow-up (the run
+ * is terminating; the parent owns the outcome). The wiring to the runner's
+ * deadline kill is verified end-to-end in the installed sources: run timeout
+ * -> terminateForTimeout (pi-subagents run-child-session.js:272) ->
+ * abortChild (:119-133) -> session.abort() (pi agent-session.js:1608-1618)
+ * -> agent.abort() -> activeRun.abortController.abort() (pi-agent-core
+ * agent.js:212-218) — the same controller ctx.getSignal() returns
+ * (agent-session.js:2449). CAVEAT (2026-09-24 incident, run 063bb4e7): the
+ * delivery is NOT durable in practice — abortChild is fire-and-forget
+ * (`void session.abort().catch(...)`), early-returns when
+ * settled/promptSettled, and a 3s abortSettleTimer force-settles the run
+ * regardless (ABORT_SETTLE_MS, run-child-session.js:35). In that incident a
+ * healthy held turn was killed by the run deadline without the abort ever
+ * surfacing here (no "hold end cause=abort" line), and the completed
+ * message was lost from every mirror because pi persists the session only
+ * AFTER extension handlers return (agent-session.js:580->581->595). That is
+ * an upstream pi-subagents reliability gap: a deadline kill should deliver
+ * an awaited abort to the child session and let in-flight extension
+ * message_end handlers finish (so the completed turn is persisted) before
+ * settling. Locally we only shrink the exposure — shorter check-ins
+ * (default 120s) and the "gate msg" proof line below.
+ *
+ * Config (pi settings.json, top-level key "processBarrier", or env fallback):
+ *   { "processBarrier": { "checkIntervalSeconds": 120, "waitTimeoutSeconds": 600 } }
+ *   PI_PROCESS_BARRIER_CHECK_INTERVAL_MS  (ms, 0 disables check-ins)
+ *   PI_PROCESS_BARRIER_TIMEOUT_SECONDS    (hard cap per wait, default 600, max 1800)
+ *
+ * Logging (observability only, never affects behavior): console.error is not
+ * captured anywhere durable (runner.stderr.log stays empty in every run dir),
+ * so after a run finishes there is no way to prove whether the barrier held,
+ * skipped, or failed to deliver. Every gate/hold/delivery decision is
+ * therefore appended (one timestamped line per event) to a durable log file:
+ * alongside the child's session.jsonl (async run sessions are named by run
+ * id, so the log stays correlate-able), falling back to
+ * os.tmpdir()/pi-process-barrier/session-<pid>.log for sessions without a
+ * session file. The log is size-capped (~256KB, oldest lines truncated) and
+ * every write is failure-safe: logging problems are swallowed and can never
+ * alter wait/wake/delivery behavior.
  */
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
-
-import { type Static, Type } from "typebox";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const DEFAULT_TIMEOUT_SECONDS = 600;
-const MAX_TIMEOUT_SECONDS = 1800;
+const DEFAULT_WAIT_TIMEOUT_SECONDS = 600;
+const MAX_WAIT_TIMEOUT_SECONDS = 1800;
 const LIST_FALLBACK_MS = 1000; // no reply -> assume no manager (extension not loaded)
+const LIST_RETRY_TIMEOUT_MS = 500; // re-check window per turn-end gate retry
+const LIST_RETRY_MAX_ATTEMPTS = 3; // total attempts at the turn-end gate (incl. the first)
 const POLL_INTERVAL_MS = 2500; // safety-net poll while blocked
-const DEFAULT_CHECK_INTERVAL_MS = 300_000; // 5 min: wake the agent to verify nothing is hanging
+const DEFAULT_CHECK_INTERVAL_MS = 120_000; // 2 min: wake the agent to verify nothing is hanging; shrinks the window a hold can outlive a run deadline in
 const MIN_CHECK_INTERVAL_MS = 5_000; // sanity floor: keep interplay with the follow-up call sane
 const MAX_CHECK_INTERVAL_SECONDS = 86_400; // 24h cap for the settings value
+
+// Durable log caps: truncate oldest lines past the byte cap, keeping roughly
+// the newest half (aligned to whole lines).
+const LOG_FILE_NAME = "process-barrier.log";
+const LOG_MAX_BYTES = 256 * 1024;
+const LOG_TRIM_KEEP_BYTES = 128 * 1024;
 
 /**
  * Resolve pi's agent settings directory. Mirrors pi core's getAgentDir()
@@ -78,20 +131,29 @@ function getAgentDir(): string {
  * file) is to read the file directly at factory init.
  *
  * Expected shape (top-level key "processBarrier"):
- *   { "processBarrier": { "checkIntervalSeconds": 300 } }
+ *   { "processBarrier": { "checkIntervalSeconds": 120, "waitTimeoutSeconds": 600 } }
  * Absent key/invalid value -> fallback (default).
  */
-function readSettings(): { checkIntervalSeconds?: number } {
+function readSettings(): {
+  checkIntervalSeconds?: number;
+  waitTimeoutSeconds?: number;
+} {
   try {
     const raw = readFileSync(join(getAgentDir(), "settings.json"), "utf-8");
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     const cfg = parsed?.processBarrier;
     if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) return {};
+    const out: { checkIntervalSeconds?: number; waitTimeoutSeconds?: number } =
+      {};
     const rawInterval = (cfg as Record<string, unknown>).checkIntervalSeconds;
-    if (typeof rawInterval !== "number" || !Number.isFinite(rawInterval)) {
-      return {};
+    if (typeof rawInterval === "number" && Number.isFinite(rawInterval)) {
+      out.checkIntervalSeconds = rawInterval;
     }
-    return { checkIntervalSeconds: rawInterval };
+    const rawTimeout = (cfg as Record<string, unknown>).waitTimeoutSeconds;
+    if (typeof rawTimeout === "number" && Number.isFinite(rawTimeout)) {
+      out.waitTimeoutSeconds = rawTimeout;
+    }
+    return out;
   } catch {
     return {};
   }
@@ -109,74 +171,15 @@ function readEnvInt(name: string, fallback: number): number {
   }
 }
 
-const BARRIER_TOOL_NAME = "barrier";
-
 /**
- * Session-scoped id-set of barrier toolCall ids INJECTED by this
- * extension (never removed: it records provenance for the session's lifetime,
- * so a block decision never depends on the retire/context-scrub lifecycle).
- * The loader re-evaluates this module per session (jiti moduleCache: false),
- * so this never leaks across sessions.
+ * Session-scoped flag: set once the process manager has answered ANY list
+ * request this session. Lets the turn-end gate retry (see requestListAtTurnEnd)
+ * distinguish a manager that is present but slow (retry is worth it) from one
+ * that was never loaded (keep the old single-shot latency). The loader
+ * re-evaluates this module per session (jiti moduleCache: false), so this
+ * never leaks across sessions.
  */
-const injectedBarrierCallIds = new Set<string>();
-
-/**
- * Session-scoped id-set of BLOCKED (model-authored) barrier call ids.
- * A blocked call produces an error toolResult with no barrier execution; these
- * ids are hidden from the model-visible context by the context filter below so
- * the model never sees evidence of its attempt. Not evicted for the session.
- */
-const blockedBarrierCallIds = new Set<string>();
-
-// Session-scoped one-shot registration guard. The loader re-evaluates this
-// module per session (jiti moduleCache: false), so this flag never leaks
-// across sessions: the tool is registered at most once per session, eagerly
-// at factory init.
-let registered = false;
-
-// History-scrub bookkeeping, also session-scoped (same re-evaluation rule as
-// `registered`). A barrier wait's toolCall/toolResult pair must stay visible
-// to the immediate wake-up follow-up LLM call (that call reads the process
-// summary from the toolResult). The pair is SERVED as soon as it is shown to
-// that call (a context projection) and RETIRED the moment the wake-up call's
-// assistant message is finalized (message_end), so any later LLM call —
-// further calls within the same turn or later turns — never sees it. The
-// message_start(user) and new-injection retire paths remain as idempotent
-// safety nets. Retired pairs are stripped from the model-visible context on
-// every subsequent LLM call via the pi context event, so the model never sees
-// a past barrier invocation in history and cannot imitate it.
-let currentBarrierCallId: string | undefined;
-const retiredBarrierCallIds = new Set<string>();
-
-/**
- * The invocation that has already been shown to the wake-up follow-up LLM
- * call via a context projection but whose assistant message has not yet been
- * finalized. From that message's message_end it is retired immediately, so
- * later LLM calls never see it. Always equals currentBarrierCallId while set
- * (set in the context handler, cleared by retireId).
- */
-let servedBarrierCallId: string | undefined;
-
-/**
- * Move an id to the hidden set and drop it from the current/served slot(s).
- * Idempotent (Set.add dedupes); safe for undefined; clears both references to
- * the id so a retired invocation can never be re-served or re-injected.
- */
-function retireId(id: string | undefined): void {
-  if (id === undefined) return;
-  retiredBarrierCallIds.add(id);
-  if (currentBarrierCallId === id) currentBarrierCallId = undefined;
-  if (servedBarrierCallId === id) servedBarrierCallId = undefined;
-}
-
-/** Retire the current active invocation (if any): it moves to the hidden set. */
-function retireCurrentBarrier(): void {
-  retireId(currentBarrierCallId);
-}
-
-const DIRECT_CALL_ERROR_MESSAGE =
-  "barrier is an internal helper: it only waits for processes started with the process tool. " +
-  "There are currently no running processes, so there is nothing to wait for. Do not call it directly.";
+let managerReplied = false;
 
 /** Minimal structural view of the @aliou/pi-processes ProcessInfo payload. */
 interface ProcessInfo {
@@ -191,6 +194,10 @@ interface ProcessInfo {
   errorMessage: string | null;
   /** Epoch ms when the process started (when the manager provides it). */
   startTime: number | null;
+  /** Absolute path to the process's stdout log (when the manager provides it). */
+  stdoutFile?: string;
+  /** Absolute path to the process's stderr log (when the manager provides it). */
+  stderrFile?: string;
 }
 
 interface ReportEntry {
@@ -205,10 +212,14 @@ interface ReportEntry {
   startTime: number | null;
 }
 
+/** What ended a wait (observability only; logged at hold end). */
+type WaitCause = "processes:ended" | "poll" | "cap" | "abort" | "checkpoint";
+
 /** Outcome of waiting: either the final report or an early check-in wake-up. */
 interface WaitResult {
   entries: ReportEntry[];
   checkpoint: boolean;
+  cause: WaitCause;
 }
 
 /** Statuses that count as still alive at snapshot time. */
@@ -223,6 +234,44 @@ function isDone(status: string): boolean {
   );
 }
 
+/** Outcome of one list request: the list plus whether the manager answered. */
+interface ListAttempt {
+  list: ProcessInfo[];
+  /** False when the request timed out (or the bus threw) instead of replying. */
+  replied: boolean;
+}
+
+/**
+ * Emit one bounded list request. `timeoutMs` caps how long we wait for the
+ * manager's reply; on timeout/error the attempt resolves with replied=false
+ * (empty list) instead of throwing.
+ */
+function requestListAttempt(
+  pi: ExtensionAPI,
+  timeoutMs: number,
+): Promise<ListAttempt> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (list: unknown, replied: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (replied) managerReplied = true;
+      resolve({
+        list: Array.isArray(list) ? (list as ProcessInfo[]) : [],
+        replied,
+      });
+    };
+    try {
+      pi.events.emit("processes:request:list", {
+        reply: (list: ProcessInfo[]) => finish(list, true),
+      });
+    } catch {
+      finish([], false);
+    }
+    setTimeout(() => finish([], false), timeoutMs);
+  });
+}
+
 /**
  * Ask the process manager for the current process list by emitting a sync
  * request over the shared extension event bus (same channel/handler shape the
@@ -230,43 +279,26 @@ function isDone(status: string): boolean {
  * the reply never arrives and we fall back to [].
  */
 function requestList(pi: ExtensionAPI): Promise<ProcessInfo[]> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (list: unknown): void => {
-      if (settled) return;
-      settled = true;
-      resolve(Array.isArray(list) ? (list as ProcessInfo[]) : []);
-    };
-    try {
-      pi.events.emit("processes:request:list", {
-        reply: (list: ProcessInfo[]) => finish(list),
-      });
-    } catch {
-      finish([]);
-    }
-    setTimeout(() => finish([]), LIST_FALLBACK_MS);
-  });
+  return requestListAttempt(pi, LIST_FALLBACK_MS).then((a) => a.list);
 }
 
 /**
- * Add/remove the barrier tool from the session's ACTIVE tool set. Tools outside
- * the active set are excluded from the model's function-calling schema, so this
- * is what keeps the tool invisible to models except exactly while processes are
- * running. Idempotent; never throws (action methods may still be unbound during
- * extension load, and a failed toggle must never break a turn or the relay).
+ * Turn-end gate variant used by the message_end handler. A single timed-out
+ * request must not be read as "nothing running": a slow manager reply (e.g.
+ * under load) would skip the wait, the parent's settle-drain would arm on a
+ * live run, and the run would be recorded as failed — the exact wake-abort
+ * failure this extension exists to prevent. Retry a bounded number of times,
+ * but ONLY while the manager has answered at least once this session, so
+ * sessions without the manager keep their old single-shot latency.
  */
-function setBarrierActive(pi: ExtensionAPI, on: boolean): void {
-  try {
-    const active = pi.getActiveTools();
-    const has = active.includes(BARRIER_TOOL_NAME);
-    if (on && !has) {
-      pi.setActiveTools([...active, BARRIER_TOOL_NAME]);
-    } else if (!on && has) {
-      pi.setActiveTools(active.filter((n) => n !== BARRIER_TOOL_NAME));
-    }
-  } catch {
-    // Never throw.
+async function requestListAtTurnEnd(pi: ExtensionAPI): Promise<ListAttempt> {
+  let attempt = await requestListAttempt(pi, LIST_FALLBACK_MS);
+  let tries = 1;
+  while (!attempt.replied && managerReplied && tries < LIST_RETRY_MAX_ATTEMPTS) {
+    attempt = await requestListAttempt(pi, LIST_RETRY_TIMEOUT_MS);
+    tries++;
   }
+  return attempt;
 }
 
 function toReportEntry(p: ProcessInfo): ReportEntry {
@@ -314,30 +346,34 @@ function formatReport(entries: ReportEntry[], timedOutSeconds: number): string {
 }
 
 /**
- * Check-in formatter: the barrier resolved early (interval elapsed, processes
+ * Check-in formatter: the wait resolved early (interval elapsed, processes
  * still running) to wake the agent for a periodic health check. Shows live
  * per-process status and uptime when the manager provides startTime.
  */
-function formatCheckpoint(entries: ReportEntry[], elapsedSeconds: number): string {
+function formatCheckpoint(
+  entries: ReportEntry[],
+  elapsedSeconds: number,
+): string {
   const lines = entries.map((e) => {
     const uptime =
       typeof e.startTime === "number" && e.startTime > 0
         ? `, uptime: ${Math.max(0, Math.round((Date.now() - e.startTime) / 1000))}s`
         : "";
-    return `- ${e.id} \"${e.name}\" (${e.status}${uptime})`;
+    return `- ${e.id} "${e.name}" (${e.status}${uptime})`;
   });
   return [
     `Still waiting after ${elapsedSeconds}s; processes still running:`,
     ...lines,
-    "Check whether any process is hanging (process list / process output), then simply end your turn: the barrier will keep waiting.",
+    "Check whether any process is hanging (process list / process output), then simply end your turn: the wait continues automatically.",
   ].join("\n");
 }
 
 /**
  * Block until every watched process reaches a final status (exited, killed,
- * terminate_timeout), the deadline passes, or the execute() abort signal
- * fires. Uses the manager's live `processes:ended` broadcasts plus a polling
- * safety net (also re-checks on `processes:changed`).
+ * terminate_timeout), the deadline passes, or the abort signal fires. Uses
+ * the manager's live `processes:ended` broadcasts plus a polling safety net
+ * (also re-checks on `processes:changed`). Resolves early with
+ * checkpoint=true when checkIntervalMs elapses while processes still run.
  */
 function waitForAllExited(
   pi: ExtensionAPI,
@@ -356,11 +392,11 @@ function waitForAllExited(
     let timer: ReturnType<typeof setTimeout> | undefined;
     const unsubs: Array<() => void> = [];
 
-    const finish = (result: WaitResult): void => {
+    const finish = (result: WaitResult, cause: WaitCause): void => {
       if (settled) return;
       settled = true;
       cleanup();
-      resolve(result);
+      resolve({ ...result, cause });
     };
 
     const cleanup = (): void => {
@@ -382,7 +418,7 @@ function waitForAllExited(
     };
 
     const onAbort = (): void => {
-      finish({ entries: finalize(), checkpoint: false });
+      finish({ entries: finalize(), checkpoint: false }, "abort");
     };
 
     const finalize = (): ReportEntry[] => {
@@ -421,17 +457,17 @@ function waitForAllExited(
       latestList = list;
       for (const p of list) record(p);
       if (allDone()) {
-        finish({ entries: finalize(), checkpoint: false });
+        finish({ entries: finalize(), checkpoint: false }, "poll");
         return;
       }
       if (Date.now() >= deadline) {
-        finish({ entries: finalize(), checkpoint: false });
+        finish({ entries: finalize(), checkpoint: false }, "cap");
         return;
       }
       if (checkIntervalMs > 0 && Date.now() - startTime >= checkIntervalMs) {
         // Early resolve: the agent is woken for a health check; its next
-        // terminal turn re-injects the barrier and the wait continues.
-        finish({ entries: checkpointEntries(), checkpoint: true });
+        // terminal turn re-enters the wait via the message_end handler.
+        finish({ entries: checkpointEntries(), checkpoint: true }, "checkpoint");
         return;
       }
       scheduled = false;
@@ -450,7 +486,9 @@ function waitForAllExited(
     unsubs.push(
       pi.events.on("processes:ended", (data) => {
         record(data as ProcessInfo);
-        if (allDone()) finish({ entries: finalize(), checkpoint: false });
+        if (allDone()) {
+          finish({ entries: finalize(), checkpoint: false }, "processes:ended");
+        }
       }),
       pi.events.on("processes:changed", () => {
         // A process may have ended without us catching the individual event;
@@ -460,7 +498,7 @@ function waitForAllExited(
     );
 
     if (signal?.aborted) {
-      finish({ entries: finalize(), checkpoint: false });
+      finish({ entries: finalize(), checkpoint: false }, "abort");
       return;
     }
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -471,38 +509,278 @@ function waitForAllExited(
   });
 }
 
-const BarrierParams = Type.Object({
-  timeoutSeconds: Type.Optional(
-    Type.Number({
-      description: "Max seconds to wait (default 600, max 1800).",
-    }),
-  ),
-  checkIntervalSeconds: Type.Optional(
-    Type.Number({
-      description:
-        "Direct-call override: seconds to wait before waking the agent for a periodic health check (0 disables). " +
-        "On automatic injection, the pi setting processBarrier.checkIntervalSeconds is used " +
-        "(fallback: env PI_PROCESS_BARRIER_CHECK_INTERVAL_MS, default 300).",
-    }),
-  ),
-});
+/**
+ * Durable dump directory for process outputs captured when a wait ends with
+ * processes still running (timeout/abort). Lives outside the run's temp log
+ * dir, which @aliou deletes on session_shutdown, so the output survives for
+ * forensics.
+ */
+const PROCESS_DUMP_ROOT = join(homedir(), ".pi", "agent", "process-dumps");
+
+/** Guard: cap each copied log stream at this many bytes when dumping. */
+const DUMP_MAX_STREAM_BYTES = 8 * 1024 * 1024;
+
+/** Guard: inline the leading lines only for small dumps. */
+const DUMP_INLINE_MAX_BYTES = 64 * 1024;
+const DUMP_INLINE_LINES = 40;
+
+/**
+ * Ask the process manager for one process's on-disk log file paths (the
+ * stdout/stderr/combined `.log` files under its temp log dir). Mirrors
+ * `requestList`'s sync-request shape; falls back to null when the manager is
+ * not loaded or does not reply.
+ */
+function requestLogFiles(
+  pi: ExtensionAPI,
+  id: string,
+): Promise<{ stdoutFile: string; stderrFile: string } | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (files: unknown): void => {
+      if (settled) return;
+      settled = true;
+      const f = files as
+        | { stdoutFile?: unknown; stderrFile?: unknown }
+        | null
+        | undefined;
+      if (
+        f &&
+        typeof f === "object" &&
+        typeof f.stdoutFile === "string" &&
+        typeof f.stderrFile === "string"
+      ) {
+        resolve({ stdoutFile: f.stdoutFile, stderrFile: f.stderrFile });
+      } else {
+        resolve(null);
+      }
+    };
+    try {
+      pi.events.emit("processes:request:log_files", {
+        id,
+        reply: (files: unknown) => finish(files),
+      });
+    } catch {
+      finish(null);
+    }
+    setTimeout(() => finish(null), LIST_FALLBACK_MS);
+  });
+}
+
+/**
+ * Copy each still-running process's available log streams into a durable
+ * dump directory, BEFORE @aliou's session_shutdown cleanup deletes the
+ * process temp logs. Returns a list of report lines (one per dumped stream);
+ * every unusual condition degrades to an explanatory note so the caller can
+ * still include it in the report. Never throws.
+ */
+async function dumpStillRunningOutputs(
+  pi: ExtensionAPI,
+  entries: ReportEntry[],
+): Promise<string[]> {
+  const stillRunning = entries.filter(
+    (e) => e.status === "still_running",
+  );
+  if (stillRunning.length === 0) return [];
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const dumpDir = join(PROCESS_DUMP_ROOT, stamp);
+  try {
+    mkdirSync(dumpDir, { recursive: true });
+  } catch {
+    return [
+      `[process-barrier] could not create dump dir ${dumpDir}; skipped output capture`,
+    ];
+  }
+
+  const notes: string[] = [];
+  for (const entry of stillRunning) {
+    let files: { stdoutFile: string; stderrFile: string } | null = null;
+    try {
+      files = await requestLogFiles(pi, entry.id);
+    } catch {
+      files = null;
+    }
+    if (!files) {
+      notes.push(
+        `- ${entry.id} "${entry.name}" still running; no log files available to capture`,
+      );
+      continue;
+    }
+
+    for (const [kind, file] of [
+      ["stdout", files.stdoutFile],
+      ["stderr", files.stderrFile],
+    ] as const) {
+      try {
+        if (!existsSync(file)) continue;
+        const size = statSync(file).size ?? 0;
+        if (size <= 0) continue;
+        const bytes = readFileSync(file);
+        const capped = bytes.length > DUMP_MAX_STREAM_BYTES
+          ? bytes.subarray(bytes.length - DUMP_MAX_STREAM_BYTES)
+          : bytes;
+        const dest = join(dumpDir, `${entry.id}.${kind}.log`);
+        writeFileSync(dest, capped);
+        notes.push(
+          `- ${entry.id} "${entry.name}" ${kind} dumped to ${dest} (${capped.length} bytes)`,
+        );
+        if (capped.length <= DUMP_INLINE_MAX_BYTES) {
+          const head = capped
+            .toString("utf-8")
+            .split(/\r?\n/)
+            .filter((l) => l.length > 0)
+            .slice(0, DUMP_INLINE_LINES)
+            .join("\n");
+          if (head.length > 0) {
+            notes.push(`  head:\n${head}`);
+          }
+        }
+      } catch {
+        notes.push(
+          `- ${entry.id} "${entry.name}" ${kind} could not be captured (unreadable/deleted)`,
+        );
+      }
+    }
+  }
+  return notes;
+}
+
+/**
+ * Resolve the durable log target for this session. Preference: alongside the
+ * child's session.jsonl (async run sessions are named by run id, so the log
+ * stays correlate-able with the run dir's status/events files); fallback to
+ * os.tmpdir()/pi-process-barrier/session-<pid>.log for sessions without a
+ * session file (e.g. in-memory sessions). Never throws.
+ */
+function resolveLogTarget(ctx: unknown): { path: string; where: string } {
+  try {
+    const sm = (
+      ctx as {
+        sessionManager?: { getSessionFile?: () => string | undefined } | null;
+      } | null
+    )?.sessionManager;
+    const sessionFile = sm?.getSessionFile?.();
+    if (sessionFile) {
+      return {
+        path: join(dirname(sessionFile), LOG_FILE_NAME),
+        where: "session-dir",
+      };
+    }
+  } catch {
+    // fall through to the tmpdir fallback
+  }
+  return {
+    path: join(tmpdir(), "pi-process-barrier", `session-${process.pid}.log`),
+    where: "tmpdir-fallback",
+  };
+}
+
+/**
+ * Append one line, truncating oldest lines when the log grows past
+ * LOG_MAX_BYTES (keeping roughly LOG_TRIM_KEEP_BYTES of the newest lines,
+ * aligned to whole lines). Logging must never throw into the event pipeline:
+ * every failure is swallowed and never affects wait/wake/delivery behavior.
+ */
+function appendLogLine(path: string, line: string): void {
+  try {
+    try {
+      if (statSync(path).size > LOG_MAX_BYTES) {
+        const old = readFileSync(path);
+        const kept = old.subarray(
+          Math.max(0, old.length - LOG_TRIM_KEEP_BYTES),
+        );
+        const nl = kept.indexOf(10); // first newline: keep whole lines only
+        writeFileSync(path, nl >= 0 ? kept.subarray(nl + 1) : kept);
+      }
+    } catch {
+      // missing/unreadable file: fall through and just append
+    }
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, line + "\n");
+  } catch {
+    // log I/O must never break the extension
+  }
+}
+
+/** Sender shape shared by handler ctx and the ExtensionAPI actions. */
+type Sender = { sendUserMessage?: (content: string, options?: object) => unknown };
+
+/**
+ * Queue the report as a follow-up user message so the agent gets a reaction
+ * turn. Handler ctx exposes sendUserMessage; the extension actions are the
+ * fallback. Never throws (a failed delivery must not break the relay).
+ * Delivery outcomes are logged: `queued` after a successful call; `FAILED`
+ * with the reason on the previously-silent no-op path (no sendUserMessage on
+ * ctx or pi) and on throw. (True delivery/consumption happens when the agent
+ * loop processes the queue — not observable here, hence "queued".)
+ */
+function deliverFollowUp(
+  api: ExtensionAPI,
+  ctx: unknown,
+  text: string,
+  log?: (event: string, detail?: string) => void,
+): void {
+  try {
+    const viaCtx = (ctx as Sender | null)?.sendUserMessage;
+    if (typeof viaCtx === "function") {
+      viaCtx.call(ctx, text, { deliverAs: "followUp" });
+      log?.("follow-up queued", "via=ctx");
+      return;
+    }
+    const viaPi = (api as unknown as Sender).sendUserMessage;
+    if (typeof viaPi === "function") {
+      viaPi.call(api, text, { deliverAs: "followUp" });
+      log?.("follow-up queued", "via=pi");
+      return;
+    }
+    // Previously silent: neither channel can queue. Now at least visible in
+    // the durable log (the agent will settle without a reaction turn).
+    log?.("follow-up FAILED", "reason=no sendUserMessage on ctx or pi");
+    console.error("[process-barrier] no sendUserMessage on ctx or pi; follow-up dropped");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log?.("follow-up FAILED", `reason=${message}`);
+    console.error(
+      `[process-barrier] failed to queue follow-up: ${message}`,
+    );
+  }
+}
 
 export default function (pi: ExtensionAPI): void {
-  // Factory-level config, read once at extension init. Precedence (highest wins):
-  // 1. pi settings key "processBarrier" -> { checkIntervalSeconds } (0 = disabled)
-  // 2. PI_PROCESS_BARRIER_CHECK_INTERVAL_MS env var (0 = disabled)
-  // 3. default 300s. A direct `checkIntervalSeconds` tool param still
-  //    overrides all of these on manual calls.
-  const settingsInterval = readSettings().checkIntervalSeconds;
+  // Factory-level config, read once at extension init. Precedence (highest
+  // wins): pi settings key "processBarrier" -> env var -> default.
+  const settings = readSettings();
+
+  // Hard cap per wait: settings waitTimeoutSeconds -> env
+  // PI_PROCESS_BARRIER_TIMEOUT_SECONDS -> default 600s; always within
+  // [1, MAX_WAIT_TIMEOUT_SECONDS].
+  const waitTimeoutSeconds = Math.min(
+    Math.max(
+      settings.waitTimeoutSeconds ??
+        readEnvInt(
+          "PI_PROCESS_BARRIER_TIMEOUT_SECONDS",
+          DEFAULT_WAIT_TIMEOUT_SECONDS,
+        ),
+      1,
+    ),
+    MAX_WAIT_TIMEOUT_SECONDS,
+  );
+
+  // Check-in interval: settings checkIntervalSeconds (0 = disabled) -> env
+  // PI_PROCESS_BARRIER_CHECK_INTERVAL_MS (ms, 0 = disabled) -> default 120s.
+  // Check-ins are also the liveness signal on long holds (real LLM activity).
   let checkIntervalSeconds: number;
   if (
-    settingsInterval !== undefined &&
-    Number.isFinite(settingsInterval) &&
-    settingsInterval !== 0
+    settings.checkIntervalSeconds !== undefined &&
+    Number.isFinite(settings.checkIntervalSeconds) &&
+    settings.checkIntervalSeconds !== 0
   ) {
-    // Clamp a positive settings value to a sane range; 0 must stay disabled.
-    checkIntervalSeconds =
-      Math.min(Math.max(settingsInterval, MIN_CHECK_INTERVAL_MS / 1000), MAX_CHECK_INTERVAL_SECONDS);
+    checkIntervalSeconds = Math.min(
+      Math.max(settings.checkIntervalSeconds, MIN_CHECK_INTERVAL_MS / 1000),
+      MAX_CHECK_INTERVAL_SECONDS,
+    );
+  } else if (settings.checkIntervalSeconds === 0) {
+    checkIntervalSeconds = 0;
   } else {
     const rawCheckIntervalMs = readEnvInt(
       "PI_PROCESS_BARRIER_CHECK_INTERVAL_MS",
@@ -514,229 +792,92 @@ export default function (pi: ExtensionAPI): void {
         : 0;
     checkIntervalSeconds = checkIntervalMs > 0 ? checkIntervalMs / 1000 : 0;
   }
-  // PI_PROCESS_BARRIER_TIMEOUT_SECONDS: overrides the default max wait (600s);
-  // always capped at MAX_TIMEOUT_SECONDS (1800s).
-  const defaultTimeoutSeconds = Math.min(
-    Math.max(
-      readEnvInt("PI_PROCESS_BARRIER_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
-      1,
-    ),
-    MAX_TIMEOUT_SECONDS,
-  );
 
-  // The barrier tool is registered EAGERLY at factory init (see the
-  // ensureRegistered call below) — not lazily. It must be in the
-  // registered-tool list before any subagent can spawn: pi-subagents validates
-  // each agent's frontmatter `tools:` allowlist against REGISTERED tools, and
-  // the agents that list barrier (delegate/worker/scout/oracle/
-  // worker-full) would fail to spawn with "Agent 'x' requested unavailable
-  // child tools: barrier" if it were missing. It must also be
-  // registered for auto-injected toolCalls to resolve by name. Visibility is
-  // governed separately by the active-set toggle: the tool is only ACTIVE
-  // while processes are running. The loader re-evaluates this module per
-  // session (jiti moduleCache: false), so the module-level `registered` flag
-  // is session-scoped and the tool is registered at most once per session.
-  const ensureRegistered = (currentPi: ExtensionAPI): void => {
-    if (registered) return;
+  // Durable run log: resolved lazily on the first handler call (the session
+  // file is only reachable via the handler's ctx), then reused for the
+  // session's lifetime. All writes go through appendLogLine (failure-safe).
+  let logTarget: { path: string; where: string } | null = null;
+  const log = (event: string, detail = ""): void => {
+    if (!logTarget) return;
     try {
-      currentPi.registerTool({
-        name: BARRIER_TOOL_NAME,
-        label: "Wait for Processes",
-        description:
-          "Blocks until all processes started with the process tool have exited, then reports their final statuses. " +
-          "It is automatically injected when your turn ends while processes are still running, so you will be woken with the results. " +
-          "If a configurable check-in interval has elapsed while processes still run, you will be woken periodically to verify processes aren't hanging; " +
-          "it is safe to keep your turn short (check process list/output, decide, end your turn) and the barrier will continue waiting. " +
-          "The interval is configurable in pi settings (processBarrier.checkIntervalSeconds; 0 disables periodic check-ins). " +
-          "Do not call it directly unless you deliberately want to block until processes finish; if no processes are running it will error.",
-        // No promptSnippet: custom tools without one are omitted from the
-        // "Available tools" section of the default system prompt (verified in
-        // dist/core/system-prompt.js). The tool is auto-injected, not meant for
-        // ad-hoc use.
-        parameters: BarrierParams,
-        async execute(
-          _toolCallId: string,
-          params: Static<typeof BarrierParams>,
-          signal?: AbortSignal,
-        ) {
-          const all = await requestList(pi);
-          const running = all.filter(
-            (p) => p && typeof p.id === "string" && isLive(p.status),
-          );
-          if (running.length === 0) {
-            // The agent (or anything else) called this tool directly with nothing
-            // to wait for. Throw -> the agent loop encodes it as an error tool
-            // result so the LLM sees the message above instead of a fake success.
-            throw new Error(DIRECT_CALL_ERROR_MESSAGE);
-          }
-
-          const timeoutSeconds = Math.min(
-            Math.max(params.timeoutSeconds ?? defaultTimeoutSeconds, 1),
-            MAX_TIMEOUT_SECONDS,
-          );
-          const effCheckIntervalSeconds = Math.max(
-            params.checkIntervalSeconds ?? checkIntervalSeconds,
-            0,
-          );
-          const waitStartedAt = Date.now();
-          const deadline = Date.now() + timeoutSeconds * 1000;
-          console.error(
-            `[process-barrier] waiting for ${running.length} process(es): ${running.map((p) => p.id).join(", ")} (timeout ${timeoutSeconds}s, check-in ${effCheckIntervalSeconds}s)`,
-          );
-
-          try {
-            const { entries, checkpoint } = await waitForAllExited(
-              pi,
-              running,
-              deadline,
-              signal,
-              effCheckIntervalSeconds > 0
-                ? effCheckIntervalSeconds * 1000
-                : 0,
-            );
-            if (checkpoint) {
-              const elapsedSeconds = Math.max(
-                0,
-                Math.round((Date.now() - waitStartedAt) / 1000),
-              );
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: formatCheckpoint(entries, elapsedSeconds),
-                  },
-                ],
-                details: { checkpoint: true, processes: entries },
-                // Intentionally no `terminate: true`: the follow-up LLM call after
-                // this tool batch is the periodic check-in reaction; when the agent
-                // ends its turn again the barrier is re-injected for a fresh wait.
-              };
-            }
-            const timedOutSeconds = Math.max(
-              0,
-              Math.round((deadline - Date.now()) / 1000),
-            );
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: formatReport(entries, timedOutSeconds),
-                },
-              ],
-              details: { processes: entries },
-              // Intentionally no `terminate: true`: the automatic follow-up LLM
-              // call after this tool batch IS the agent's wake-up reaction.
-            };
-          } finally {
-            // The wait resolved (or was aborted): the barrier is no longer
-            // needed in the model's schema. Any still-running processes
-            // re-activate it on the next process event or message_end.
-            setBarrierActive(pi, false);
-          }
-        },
-      });
-      registered = true;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(
-        `[process-barrier] failed to register ${BARRIER_TOOL_NAME}: ${message}`,
+      appendLogLine(
+        logTarget.path,
+        `${new Date().toISOString()} ${event}${detail ? ` ${detail}` : ""}`,
       );
-    }
-  };
-
-  // Eager registration at factory init, before any handler registration or
-  // anything else that could throw: the tool must be in the registered-tool
-  // list by the time subagent spawn preflight runs and by the time any
-  // auto-injected toolCall resolves. registerTool() is valid during extension
-  // load (tools refresh happens on bind). Visibility stays inactive here —
-  // only live-process state may add it to the ACTIVE tool set.
-  ensureRegistered(pi);
-
-  // Session start: idempotent safety — the barrier must never start ACTIVE
-  // (i.e. visible in the model's schema). Only live-process state may activate
-  // it. (At the very end of factory init action methods may still be unbound;
-  // this runs once the runtime is bound.)
-  pi.on("session_start", () => {
-    setBarrierActive(pi, false);
-  });
-
-  // Session-scope state listener: keep the barrier's visibility in sync with
-  // live process state on the shared extension event bus (the same channels
-  // used by waitForAllExited). Any live (running|terminating) process makes
-  // the tool ACTIVE; once none are live it is hidden again. (Registration
-  // already happened at factory init; ensureRegistered here is an idempotent
-  // no-op kept for robustness.)
-  const syncBarrierState = (payload: unknown): void => {
-    try {
-      const status = (payload as { status?: unknown } | null)?.status;
-      if (typeof status === "string") {
-        // processes:ended carries a single ProcessInfo with its final status;
-        // processes:started carries one with a live status. Judge by it.
-        if (isLive(status)) {
-          ensureRegistered(pi);
-          setBarrierActive(pi, true);
-        } else {
-          setBarrierActive(pi, false);
-        }
-        return;
-      }
-      // processes:changed carries only { reason: "started"|"ended"|"cleared" } —
-      // no process data. Fall back to an authoritative list snapshot.
-      void requestList(pi).then((list) => {
-        const live = list.some(
-          (p) => p && typeof p.id === "string" && isLive(p.status),
-        );
-        if (live) {
-          ensureRegistered(pi);
-          setBarrierActive(pi, true);
-        } else {
-          setBarrierActive(pi, false);
-        }
-      });
     } catch {
-      // Never throw from an event handler.
+      // logging must never throw into the event pipeline
     }
   };
-  const stateListeners: Array<() => void> = [
-    pi.events.on("processes:changed", (payload) => {
-      syncBarrierState(payload);
-    }),
-    pi.events.on("processes:ended", (payload) => {
-      syncBarrierState(payload);
-    }),
-  ];
-  pi.on("session_shutdown", () => {
-    for (const unsub of stateListeners) {
-      try {
-        unsub();
-      } catch {
-        // Never throw during shutdown.
-      }
-    }
-  });
 
+  /**
+   * One-line summary of a completed terminal assistant message for the gate
+   * log. While our handler holds, every other mirror is blind: pi core
+   * awaits extension handlers BEFORE public dispatch and session
+   * persistence (agent-session.js:580->581->595), so neither events.jsonl
+   * nor session.jsonl shows the completed turn until the hold ends. If a
+   * run dies mid-hold, THIS line is the only durable proof the turn
+   * completed normally. Never throws; degrades to a placeholder on odd
+   * content shapes.
+   */
+  const summarizeGateMessage = (m: {
+    id?: unknown;
+    content?: unknown;
+  }): string => {
+    try {
+      let totalChars = 0;
+      let firstText = "";
+      let firstThinking = "";
+      if (typeof m.content === "string") {
+        totalChars = m.content.length;
+        firstText = m.content;
+      } else if (Array.isArray(m.content)) {
+        for (const block of m.content) {
+          const b = block as {
+            type?: string;
+            text?: unknown;
+            thinking?: unknown;
+          };
+          const t = typeof b?.text === "string" ? b.text : "";
+          const th = typeof b?.thinking === "string" ? b.thinking : "";
+          totalChars += t.length + th.length;
+          if (!firstText && t) firstText = t;
+          if (!firstThinking && th) firstThinking = th;
+        }
+      }
+      const source = firstText || firstThinking;
+      const preview = source
+        .replace(/[\t\r\n]+/g, " ")
+        .replace(/["\\]/g, "'")
+        .replace(/\s{2,}/g, " ")
+        .trim()
+        .slice(0, 100);
+      const id = typeof m.id === "string" && m.id ? m.id : "-";
+      return `stopReason=stop id=${id} contentChars=${totalChars} preview="${preview}"`;
+    } catch {
+      return 'stopReason=stop id=- contentChars=? preview="(unavailable)"';
+    }
+  };
+
+  // The single handler this extension installs. pi core awaits it before
+  // relaying message_end to public listeners, so while it runs, pi-subagents
+  // has not yet seen the terminal message and cannot arm the settle-drain.
   pi.on("message_end", async (event, ctx) => {
     try {
-      // A served invocation is retired as soon as the wake-up LLM call's
-      // assistant message is finalized — message_end fires for every persisted
-      // assistant message (including ones containing further tool calls), so
-      // this runs before any LATER LLM call in the same turn (or a later turn)
-      // can see the pair. It is a no-op on other message_ends (the barrier's
-      // toolResult persistence, the final message that carried the injection):
-      // servedBarrierCallId stays undefined until the context handler below
-      // has served the pair, so the wake-up call itself still reads the
-      // process summary.
-      if (servedBarrierCallId !== undefined) {
-        retireId(servedBarrierCallId);
+      if (!logTarget) {
+        logTarget = resolveLogTarget(ctx);
+        log(
+          "init",
+          `log=${logTarget.path} via=${logTarget.where} waitTimeoutSeconds=${waitTimeoutSeconds} checkIntervalSeconds=${checkIntervalSeconds} child=${process.env.PI_SUBAGENT_CHILD ?? "-"}`,
+        );
       }
       const m = event?.message as {
         role?: string;
         stopReason?: string;
         content?: unknown[] | string | null;
       } | null;
-      // Only terminal assistant messages: last model turn, no pending tool calls.
+      // Only terminal assistant messages: last model turn, no pending tools.
       if (!m || m.role !== "assistant" || m.stopReason !== "stop") return;
-      // Defensive: never inject into truncated/failed/aborted turns.
+      // Defensive: never wait on truncated/failed/aborted turns.
       if (
         m.stopReason === "length" ||
         m.stopReason === "error" ||
@@ -751,229 +892,126 @@ export default function (pi: ExtensionAPI): void {
         return;
       }
 
-      // Snapshot currently live processes.
-      const all = await requestList(pi);
+      // Snapshot currently live processes (turn-end gate: retries a slow
+      // manager within a bounded budget before concluding "nothing running").
+      const { list: all, replied } = await requestListAtTurnEnd(pi);
       const running = all.filter(
         (p) => p && typeof p.id === "string" && isLive(p.status),
       );
       if (running.length === 0) {
-        // Nothing to wait for: hide the barrier from the model's schema so it
-        // cannot be called ad hoc while idle (authoritative re-check after any
-        // earlier wait resolved).
-        setBarrierActive(pi, false);
+        if (!replied) {
+          // Every gate attempt timed out, so waiting is skipped on
+          // inconclusive grounds; say so instead of failing silently. (A
+          // prompt, definite empty reply is the healthy idle path and stays
+          // quiet.)
+          console.error(
+            `[process-barrier] no process-list reply after ${LIST_RETRY_MAX_ATTEMPTS} attempt(s); skipping wait`,
+          );
+          log("gate", "live=0 skip: no manager reply (inconclusive)");
+        } else {
+          log("gate", "live=0 fast no-op");
+        }
+        return;
+      }
+      log(
+        "gate",
+        `live=${running.length} ids=${running.map((p) => `${p.id}("${p.name}")`).join(",")}`,
+      );
+      // Durable proof the terminal turn COMPLETED, written before our hold
+      // blinds the events mirror and the session file (see the helper's
+      // doc comment).
+      log(
+        "gate msg",
+        summarizeGateMessage(m as { id?: unknown; content?: unknown }),
+      );
+
+      const signal = (
+        ctx as { getSignal?: () => AbortSignal | undefined } | null | undefined
+      )?.getSignal?.();
+      const waitStartedAt = Date.now();
+      const deadline = waitStartedAt + waitTimeoutSeconds * 1000;
+      log(
+        "hold start",
+        `processes=${running.length} ids=${running.map((p) => p.id).join(",")} cap=${waitTimeoutSeconds}s checkin=${checkIntervalSeconds}s`,
+      );
+      console.error(
+        `[process-barrier] holding run open for ${running.length} process(es): ${running.map((p) => p.id).join(", ")} (cap ${waitTimeoutSeconds}s, check-in ${checkIntervalSeconds}s)`,
+      );
+
+      const { entries, checkpoint, cause } = await waitForAllExited(
+        pi,
+        running,
+        deadline,
+        signal,
+        checkIntervalSeconds > 0 ? checkIntervalSeconds * 1000 : 0,
+      );
+      log(
+        "hold end",
+        `cause=${cause} elapsed=${Math.max(0, Math.round((Date.now() - waitStartedAt) / 1000))}s finals=${entries.map((e) => `${e.id}:${e.status}`).join(",")}`,
+      );
+
+      // Aborted session: do not queue a follow-up; the parent owns the
+      // outcome of a terminating run.
+      if (signal?.aborted) {
+        console.error(
+          "[process-barrier] session aborted during wait; no follow-up queued",
+        );
+        log("follow-up skipped", "reason=session aborted");
         return;
       }
 
-      // A process is still running: make the barrier ACTIVE so the injected
-      // toolCall resolves by name and the model can call it. (Registration
-      // already happened at factory init; ensureRegistered is an idempotent
-      // no-op.)
-      ensureRegistered(pi);
-      setBarrierActive(pi, true);
-
-      if (!Array.isArray(m.content)) {
-        return; // cannot inject a toolCall into non-array content
+      if (checkpoint) {
+        const elapsedSeconds = Math.max(
+          0,
+          Math.round((Date.now() - waitStartedAt) / 1000),
+        );
+        log("checkpoint", `queued elapsed=${elapsedSeconds}s`);
+        deliverFollowUp(
+          pi,
+          ctx,
+          `[process-barrier] ${formatCheckpoint(entries, elapsedSeconds)}`,
+          log,
+        );
+        return;
       }
 
-      // Inject a synthetic toolCall for the barrier tool. The agent loop
-      // re-reads message.content after extension handlers run and resolves
-      // tool calls by name (no provenance check), so this executes like a
-      // normal call; its blocking execute() keeps the run alive until every
-      // watched process exits.
-      const toolCall = {
-        type: "toolCall",
-        id: `${BARRIER_TOOL_NAME}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
-        name: BARRIER_TOOL_NAME,
-        arguments: {},
-      };
-      m.content.push(toolCall as never);
-      // A new injected barrier call supersedes any previous one (only one
-      // barrier runs at a time): retire the old pair, then mark the new
-      // invocation as the CURRENT one (visible to the wake-up follow-up call).
-      retireCurrentBarrier();
-      currentBarrierCallId = toolCall.id;
-      // Record provenance AFTER retiring the previous invocation: the injected
-      // id must be recognizable as ours for the tool_call block handler and
-      // stay recorded even after the pair is retired from the context scrub.
-      injectedBarrierCallIds.add(toolCall.id);
-      console.error(
-        `[process-barrier] injected ${BARRIER_TOOL_NAME} for ${running.length} running process(es): ${running.map((p) => p.id).join(", ")} (check-in ${checkIntervalSeconds}s)`,
+      let reportText = formatReport(
+        entries,
+        Math.max(0, Math.round((deadline - Date.now()) / 1000)),
+      );
+      // Flush-on-exit: when the wait ended with processes still running
+      // (cap hit), copy their logs to a durable dump dir before @aliou's
+      // session_shutdown cleanup deletes them.
+      if (entries.some((e) => e.status === "still_running")) {
+        try {
+          const dumpNotes = await dumpStillRunningOutputs(pi, entries);
+          if (dumpNotes.length > 0) {
+            reportText +=
+              "\n\n[process-barrier] output captured for still-running processes:\n" +
+              dumpNotes.join("\n");
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          reportText +=
+            `\n\n[process-barrier] output capture failed: ${message}`;
+        }
+      }
+      const stillRunningCount = entries.filter(
+        (e) => e.status === "still_running",
+      ).length;
+      log("follow-up queued", `kind=report stillRunning=${stillRunningCount}`);
+      deliverFollowUp(
+        pi,
+        ctx,
+        `[process-barrier] Background process wait finished:\n${reportText}\nReport on these results in your final answer.`,
+        log,
       );
     } catch (err) {
-      // Never throw from a message_end handler: a failure here must not break
-      // the turn or the relay. Surface what we know and return.
+      // Never throw from a message_end handler: a failure here must not
+      // break the turn or the relay.
       const message = err instanceof Error ? err.message : String(err);
+      log("handler error", message);
       console.error(`[process-barrier] error: ${message}`);
-      const m = event?.message as { content?: unknown[] | string | null } | null;
-      if (m) {
-        const note = {
-          type: "text",
-          text: `[process-barrier] failed while waiting for processes: ${message}`,
-        };
-        if (Array.isArray(m.content)) m.content.push(note as never);
-        else m.content = [note as never];
-      }
     }
   });
-
-  // Block MODEL-AUTHORED barrier calls before they can execute.
-  // Tool calls are preflighted (agent-loop prepareToolCall) before the tool's
-  // execute() runs; extending the pi `tool_call` event here can block a call
-  // with { block: true, reason } (ToolCallEventResult, types.d.ts:778-782).
-  // Only the id the extension itself injected (recorded in
-  // injectedBarrierCallIds) may run the real wait. Any other id is
-  // model-authored (the LLM imitating the tool it briefly saw) and is blocked
-  // UNCONDITIONALLY: registration and injection are per-session, and the
-  // injected id is ALWAYS recorded (injectedBarrierCallIds.add in the
-  // message_end handler) BEFORE the agent loop executes that call — so an
-  // unrecorded id is by definition not ours, and there is no legitimate
-  // unrecorded case to allow through (no reload edge: the loader re-evaluates
-  // this module per session and injection always records first). The tool
-  // never executes, no wait starts, no duplicate watch is created. A blocked
-  // call leaves an immediate error toolResult; the tool_result tracker below
-  // records its id and the context filter hides it, so the model never sees
-  // evidence of its own attempt. The execute() guard remains only as a
-  // last-resort safety net. Never throws; a block failure must not break the
-  // turn.
-  pi.on("tool_call", (event) => {
-    try {
-      const e = event as { toolName?: unknown; toolCallId?: unknown } | null;
-      if (!e || e.toolName !== BARRIER_TOOL_NAME) return undefined;
-      const id = String(e.toolCallId ?? "");
-      if (id === "") return undefined;
-      // Provenance: only extension-injected calls may run the wait.
-      if (injectedBarrierCallIds.has(id)) return undefined;
-      return { block: true, reason: DIRECT_CALL_ERROR_MESSAGE };
-    } catch {
-      return undefined;
-    }
-  });
-
-  // A new user turn means any previous barrier wait is done — its summary was
-  // already delivered to the wake-up follow-up LLM call. Retire the current
-  // invocation: on subsequent LLM calls the context handler below strips the
-  // retired pair from the model-visible context.
-  pi.on("message_start", (event) => {
-    try {
-      if (event?.message?.role === "user") retireCurrentBarrier();
-    } catch {
-      // Never throw from an event handler.
-    }
-  });
-
-  // Record a BLOCKED (model-authored) barrier call id so the context scrub
-  // hides its error toolResult and toolCall block from the model: the goal is
-  // that the model never sees evidence it attempted the internal helper.
-  pi.on("tool_result", (event) => {
-    try {
-      const e = event as { toolName?: unknown; toolCallId?: unknown } | null;
-      if (!e || e.toolName !== BARRIER_TOOL_NAME) return;
-      const id = String(e.toolCallId ?? "");
-      if (id === "") return;
-      if (injectedBarrierCallIds.has(id)) return;
-      // Not ours => a model-authored attempt (blocked pre-execution). Mark its
-      // id blocked so the context filter hides its error toolResult.
-      blockedBarrierCallIds.add(id);
-    } catch {
-      // Never throw.
-    }
-  });
-
-  // Fired before EVERY LLM call (first of a turn AND every follow-up after
-  // tool results) with a structuredClone deep copy of the exact messages about
-  // to be sent. Strip RETIRED barrier invocations (their toolCall
-  // blocks and matching toolResult messages) so the model never sees a past
-  // barrier call in history and cannot imitate it. The CURRENT invocation
-  // stays visible: the immediate wake-up follow-up call reads the wait summary
-  // from its toolResult, and seeing it here counts as SERVING — the next
-  // message_end retires it, so no later call (same turn or later) can see or
-  // imitate it. The stored session is untouched (pi sessions are append-only —
-  // there is no delete/update entry API). Returning undefined is the no-op;
-  // never throw (the runtime also guards, but we stay defensive).
-  pi.on("context", (event) => {
-    try {
-      if (
-        retiredBarrierCallIds.size === 0 &&
-        currentBarrierCallId === undefined
-      ) {
-        return undefined; // nothing retired, nothing current -> no-op
-      }
-      const messages = event?.messages;
-      if (!Array.isArray(messages)) return undefined;
-      const filtered: Array<typeof messages[number]> = [];
-      for (const m of messages) {
-        const role = (m as { role?: string } | null)?.role;
-        if (
-          role === "toolResult" &&
-          (m as { toolName?: string } | null)?.toolName === BARRIER_TOOL_NAME &&
-          (retiredBarrierCallIds.has(
-            (m as { toolCallId?: string } | null)?.toolCallId as string,
-          ) ||
-            // Blocked (model-authored) calls also surface as error toolResults;
-            // hide them too so the model never sees evidence of its attempt.
-            blockedBarrierCallIds.has(
-              (m as { toolCallId?: string } | null)?.toolCallId as string,
-            ))
-        ) {
-          continue; // drop the retired barrier toolResult
-        }
-        if (role === "assistant" && Array.isArray((m as { content?: unknown }).content)) {
-          const original = (
-            m as {
-              content: Array<{ type?: string; name?: string; id?: string }>;
-            }
-          ).content;
-          const kept = original.filter(
-            (c) =>
-              !(
-                c?.type === "toolCall" &&
-                c?.name === BARRIER_TOOL_NAME &&
-                (retiredBarrierCallIds.has(String(c?.id)) ||
-                  blockedBarrierCallIds.has(String(c?.id)))
-              ),
-          );
-          if (
-            servedBarrierCallId === undefined &&
-            currentBarrierCallId !== undefined &&
-            original.some(
-              (c) =>
-                c?.type === "toolCall" &&
-                c?.name === BARRIER_TOOL_NAME &&
-                String(c?.id) === currentBarrierCallId,
-            )
-          ) {
-            // First time the CURRENT (not yet retired) invocation is shown to
-            // a context projection: it is being served to the wake-up call and
-            // stays visible for THIS call only; the wake-up assistant message's
-            // message_end retires it (served-then-retired). The filter above
-            // already preserved the block (its id is not retired).
-            servedBarrierCallId = currentBarrierCallId;
-          }
-          if (
-            kept.length === 0 &&
-            original.every((c) => c?.type === "toolCall")
-          ) {
-            // Only retired toolCall blocks (no text left): skip the whole
-            // message instead of emitting empty content, which some providers
-            // reject.
-            continue;
-          }
-          filtered.push({ ...(m as object), content: kept } as never);
-          continue;
-        }
-        filtered.push(m);
-      }
-      return { messages: filtered as typeof messages };
-    } catch {
-      // Never throw from a context handler: a failure must not break the LLM
-      // call. Returning undefined leaves the context untouched (no-op).
-      return undefined;
-    }
-  });
-
-  // Very end of factory init: the tool must not start ACTIVE (visible in the
-  // model's schema). When factory init still runs, action methods are unbound
-  // stubs and the helper swallows their throw; session_start repeats this once
-  // the runtime is bound.
-  setBarrierActive(pi, false);
 }
